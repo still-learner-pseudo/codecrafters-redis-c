@@ -9,6 +9,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/epoll.h>
 
 #define MAX_CLIENTS 10
 
@@ -28,6 +29,7 @@ void handle_input(char* buffer);
 void parse_input(char* buffer, char* command, char** arguments, int* argument_count, int* length);
 void set_key_value(char* key, char* value, char* buffer, char* option, int time_to_live);
 void get_key_value(char* key, char* buffer);
+void get_key_type(char* key, char* buffer);
 key_value_t* create_node(char* key, char* value, int time_to_live);
 void delete_key_value(char* key);
 void free_list();
@@ -79,61 +81,78 @@ int main() {
 	printf("Waiting for a client to connect...\n");
 	client_addr_len = sizeof(client_addr);
 
-	fd_set read_fds;
-	int max_fd = server_fd;
-	int client_fds[MAX_CLIENTS];
+	int epoll_fd = epoll_create1(0);
+	if (epoll_fd == -1) {
+		printf("epoll_create1 failed: %s \n", strerror(errno));
+		return 1;
+	}
+
+	// add the server socket to the epoll-list
+	struct epoll_event ev, events[MAX_CLIENTS];
+	ev.events = EPOLLIN;
+    ev.data.fd = server_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) == -1) {
+        printf("epoll_ctl: server_fd failed: %s\n", strerror(errno));
+        return 1;
+    }
+
 	int num_clients = 0;
+	int client_fds[MAX_CLIENTS];
 
 	while(1) {
-        FD_ZERO(&read_fds); // set all bits to zero
-        FD_SET(server_fd, &read_fds); // set server_fd bit to one
-
-        for(int i = 0; i < num_clients; i++) {
-            FD_SET(client_fds[i], &read_fds); // set client_fds[i] bit to one
-            if(client_fds[i] > max_fd)
-                max_fd = client_fds[i];
+	    // wait on the epoll-list
+    	int epoll_event_count = epoll_wait(epoll_fd, events, MAX_CLIENTS, -1);
+        if (epoll_event_count == -1) {
+            printf("epoll_wait failed: %s \n", strerror(errno));
+            break;
         }
 
-        // using select to handle multiple clients
-        int ready = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
-        // future work: use epoll instead of select because it is more efficient and scalable
-        if(ready == -1) {
-            perror("select");
-            exit(EXIT_FAILURE);
-        }
+        for (int i = 0; i < epoll_event_count; i++) {
+            int fd = events[i].data.fd;
+            if(fd == server_fd) {
+                int new_client_fd = accept(server_fd, (struct sockaddr*) &client_addr, &client_addr_len);
+                if(new_client_fd > 0) {
+                    if(num_clients < MAX_CLIENTS) {
+                        printf("Client %d Connected\n", num_clients);
+                        client_fds[num_clients++] = new_client_fd;
 
-        if(FD_ISSET(server_fd, &read_fds)) {
-            int new_client_fd = accept(server_fd, (struct sockaddr*) &client_addr, &client_addr_len);
-            if(new_client_fd > 0) {
-                if(num_clients < MAX_CLIENTS) {
-                    printf("Client %d Connected\n", num_clients);
-                    client_fds[num_clients++] = new_client_fd;
-                } else {
-                    printf("Maximum number of clients reached\n");
-                    close(new_client_fd);
+                        // add the new client also to the epoll-list
+                        ev.events = EPOLLIN;
+                        ev.data.fd = new_client_fd;
+                        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &ev) == -1) {
+                            printf("epoll_ctl: client_fd failed: %s\n", strerror(errno));
+                            close(new_client_fd);
+                            continue;
+                        }
+                    } else {
+                        printf("Maximum number of clients reached\n");
+                        close(new_client_fd);
+                    }
                 }
-            }
-        }
-
-        for(int i = 0; i < num_clients; i++) {
-            if(FD_ISSET(client_fds[i], &read_fds)) {
+            } else {
                 char buffer[1024];
-                ssize_t bytes_read = read(client_fds[i], buffer, sizeof(buffer));
+                ssize_t bytes_read = read(fd, buffer, sizeof(buffer));
                 if(bytes_read > 0) {
                     buffer[bytes_read] = '\0';
-                    printf("Client %d: %s\n", i, buffer);
+                    printf("Client %d: %s\n", fd, buffer);
                     handle_input(buffer);
-                    write(client_fds[i], buffer, strlen(buffer));
+                    write(fd, buffer, strlen(buffer));
                 } else if(bytes_read == 0) {
                     printf("Client %d disconnected\n", i);
-                    close(client_fds[i]);
-                    for (int j = i; j < num_clients - 1; j++) {
-                        client_fds[j] = client_fds[j + 1];
+                    close(fd);
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+
+                    for(int j = 0; j < num_clients; j++) {
+                        if(client_fds[j] == fd) {
+                            for (int k = j; k < num_clients - 1; k++) {
+                                client_fds[k] = client_fds[k + 1];
+                            }
+                            num_clients--;
+                            break;
+                        }
                     }
-                    num_clients--;
-                    i--;
                 } else {
-                    printf("Error reading from client %d: %s\n", i, strerror(errno));
+                    printf("Error reading from client %d: %s\n", fd, strerror(errno));
                 }
             }
         }
@@ -174,6 +193,12 @@ void handle_input(char* buffer) {
             strcpy(buffer, "-ERR wrong number of arguments for 'get' command\r\n");
         } else {
             get_key_value(arguments[1], buffer);
+        }
+    } else if (strcmp(command, "TYPE") == 0) {
+        if (arguments_count < 2) { // if there are less than 2 arguments that means only the command TYPE was sent, key is missing
+            strcpy(buffer, "-ERR wrong number of arguments for 'type' command\r\n");
+        } else {
+            get_key_type(arguments[1], buffer);
         }
     }
 
@@ -255,13 +280,22 @@ void get_key_value(char* key, char* buffer) {
     strcpy(buffer, "$-1\r\n");
 }
 
+void get_key_type(char* key, char* buffer) {
+    get_key_value(key, buffer);
+    if (buffer[0] == '$' && buffer[1] != '-') {
+        strcpy(buffer, "+string\r\n");
+    } else {
+        strcpy(buffer, "+none\r\n");
+    }
+}
+
 // we use this function to delete the key value pair from the linked list.
 void delete_key_value(char* key) {
     key_value_t* current = head;
     key_value_t* prev = NULL;
     while(current != NULL) {
-        if(strcmp(current->key, key) == 0) {
-            if(prev == NULL) {
+        if (strcmp(current->key, key) == 0) {
+            if (prev == NULL) {
                 head = current->next;
             } else {
                 prev->next = current->next;
@@ -271,11 +305,8 @@ void delete_key_value(char* key) {
             free(current);
             return;
         }
-        key_value_t* next = current->next;
-        free(current->key);
-        free(current->value);
-        free(current);
-        current = next;
+        prev = current;
+        current = current->next;
     }
 }
 
