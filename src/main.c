@@ -11,6 +11,7 @@
 #include <sys/time.h>
 #include <sys/epoll.h>
 #include "hashmap.h"
+#include "double_linked_list.h"
 
 #define MAX_CLIENTS 10
 #define CAPACITY 1000
@@ -19,10 +20,14 @@ hashmap map;
 
 void handle_input(char* buffer);
 void parse_input(char* buffer, char* command, char** arguments, int* argument_count, int* length);
+// these are for key-value operations
 void set_key_value(char* key, char* value, char* buffer, char* option, int time_to_live);
 void get_key_value(char* key, char* buffer);
 void get_key_type(char* key, char* buffer);
 void delete_key_value(char* key);
+// these are for list operations
+void push_to_list(char* command, char* key, char** arguments, int arguments_count, char* buffer);
+void range_list(char* key, int start, int end, char* buffer);
 
 int main() {
 	// Disable output buffering
@@ -193,6 +198,18 @@ void handle_input(char* buffer) {
         } else {
             get_key_type(arguments[1], buffer);
         }
+    } else if ((strcmp(command, "RPUSH") == 0) || (strcmp(command, "LPUSH") == 0)) {
+        if (arguments_count < 3) {
+            strcpy(buffer, "-ERR wrong number of arguments for 'rpush' command\r\n");
+        } else {
+            push_to_list(command, arguments[1], arguments, arguments_count, buffer);
+        }
+    } else if (strcmp(command, "LRANGE") == 0) {
+        if (arguments_count < 4) {
+            strcpy(buffer, "-ERR wrong number of arguments for 'lrange' command\r\n");
+        } else {
+            range_list(arguments[1], atoi(arguments[2]), atoi(arguments[3]), buffer);
+        }
     }
 
     for(int i = 0; i < arguments_count; i++) {
@@ -202,19 +219,28 @@ void handle_input(char* buffer) {
 
 // this function sets the key value pair in the hashmap, for now ignoring the options value
 void set_key_value(char* key, char* value, char* buffer, char* options, int time_to_live) {
-    metadata* meta = malloc(sizeof(metadata));
-    if (!meta) {
+    metadata* metadata_value = malloc(sizeof(metadata));
+    if (!metadata_value) {
         strcpy(buffer, "-ERR out of memory\r\n");
         return;
     }
 
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    meta->timestamp = tv.tv_sec * 1000LL + tv.tv_usec / 1000LL;
-    meta->time_to_live = time_to_live;
+    metadata_value->timestamp = tv.tv_sec * 1000LL + tv.tv_usec / 1000LL;
+    metadata_value->time_to_live = time_to_live;
 
-    hashmap_add_entry(&map, key, value, meta);
+    char* value_copy = strdup(value);
+    if (!value_copy) {
+        strcpy(buffer, "-ERR out of memory\r\n");
+        free(metadata_value);
+        return;
+    }
+
+    hashmap_add_entry(&map, key,(void*) value_copy, metadata_value, TYPE_STRING);
     strcpy(buffer, "+OK\r\n");
+
+    free(metadata_value);
 }
 
 void get_key_value(char* key, char* buffer) {
@@ -234,8 +260,15 @@ void get_key_value(char* key, char* buffer) {
                 }
             }
 
-            snprintf(buffer, 1024, "$%ld\r\n%s\r\n", strlen(current->value), current->value);
-            return;
+            if (current->value_type == TYPE_STRING) {
+                snprintf(buffer, 1024, "$%ld\r\n%s\r\n", strlen(current->value), current->value);
+                return;
+            } else if (current->value_type == TYPE_LIST) {
+                // do nothing for now
+                return;
+            } else {
+                strcpy(buffer, "$-1\r\n");
+            }
         }
         current = current->next;
     }
@@ -255,6 +288,61 @@ void get_key_type(char* key, char* buffer) {
 
 void delete_key_value(char* key) {
     hashmap_delete_entry(&map, key);
+}
+
+void push_to_list(char* command, char* key, char** arguments, int arguments_count, char* buffer) {
+    hashmap_entry* entry = hashmap_find_entry(&map, key);
+    list* push_list;
+
+    if (entry == NULL) {
+        push_list = create_list();
+        if (!push_list) {
+            strcpy(buffer, "-ERR\r\n");
+            return;
+        }
+        metadata* metadata_value = malloc(sizeof(metadata));
+        metadata_value->timestamp = 0;
+        metadata_value->time_to_live = -1;
+
+        hashmap_add_entry(&map, key, push_list, metadata_value, TYPE_LIST);
+    } else {
+        if (entry->value_type != TYPE_LIST) {
+            strcpy(buffer, "-ERR\r\n");
+            return;
+        }
+        push_list = (list*)entry->value;
+    }
+
+    if (strcmp(command, "RPUSH") == 0 ) {
+        for(int i = 2; i < arguments_count; i++) { // skip first two arguments i.e command and key
+            char* val = strdup(arguments[i]);
+            append_to_list(push_list, (void*) val);
+        }
+    } else if (strcmp(command, "LPUSH") == 0) {
+        for(int i = 2; i < arguments_count; i++) { // skip first two arguments i.e command and key
+            char* val = strdup(arguments[i]);
+            prepend_to_list(push_list, (void*) val);
+        }
+    }
+
+
+    snprintf(buffer, 1024, ":%ld\r\n", push_list->size);
+}
+
+void range_list(char* key, int start, int end, char* buffer) {
+    char temp[1024];
+    hashmap_entry* entry = hashmap_find_entry(&map, key);
+    list* push_list = NULL;
+
+    if (entry != NULL && entry->value_type == TYPE_LIST) {
+        push_list = (list*) entry->value;
+    } else {
+        strcpy(buffer, "*0\r\n");
+        return;
+    }
+
+    get_values_array(push_list, start, end, temp);
+    strcpy(buffer, temp);
 }
 
 // please refer here for RESP protocol specification:

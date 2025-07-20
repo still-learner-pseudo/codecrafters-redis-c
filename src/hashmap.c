@@ -28,7 +28,13 @@ void hashmap_destroy(hashmap* hashmap) {
         while(current != NULL) {
             hashmap_entry* next = current->next;
             free(current->key);
-            free(current->value);
+
+            if (current->value_type == TYPE_STRING) {
+                free((char*) current->value);
+            } else if (current->value_type == TYPE_LIST) {
+                destroy_list((list*) current->value);
+            }
+
             free(current->metadata);
 
             if(current != &hashmap->entries[i])
@@ -50,8 +56,8 @@ size_t hash(const char* key) {
     return hash;
 }
 
-void hashmap_add_entry(hashmap* hashmap, const char* key, const char* value, metadata* metadata) {
-    if(hashmap == NULL || key == NULL || value == NULL || metadata == NULL) {
+void hashmap_add_entry(hashmap* hashmap, const char* key, void* value, metadata* metadata_value, value_type value_type) {
+    if(hashmap == NULL || key == NULL || value == NULL || metadata_value == NULL) {
         return;
     }
 
@@ -62,8 +68,11 @@ void hashmap_add_entry(hashmap* hashmap, const char* key, const char* value, met
     // check if the head is NULL
     if(head->key == NULL) {
         head->key = strdup(key);
-        head->value = strdup(value);
-        head->metadata = metadata;
+        head->value = value;
+        head->value_type = value_type;
+        head->metadata = malloc(sizeof(metadata));
+        memcpy(head->metadata, metadata_value, sizeof(metadata));
+
         head->next = NULL;
         return;
     }
@@ -71,10 +80,16 @@ void hashmap_add_entry(hashmap* hashmap, const char* key, const char* value, met
     hashmap_entry* current = head;
     while(current->next != NULL) {
         if(strcmp(current->key, key) == 0) {
-            free(current->value);
-            current->value = strdup(value);
+            if(current->value_type == TYPE_STRING) {
+                free((char*) current->value);
+            } else if(current->value_type == TYPE_LIST) {
+                destroy_list((list*) current->value);
+            }
+            current->value = value;
             free(current->metadata);
-            current->metadata = metadata;
+            current->metadata = malloc(sizeof(metadata));
+            memcpy(current->metadata, metadata_value, sizeof(metadata));
+            current->value_type = value_type;
 
             return;
         }
@@ -87,8 +102,10 @@ void hashmap_add_entry(hashmap* hashmap, const char* key, const char* value, met
 
     hashmap_entry* new_entry = (hashmap_entry*) malloc(sizeof(hashmap_entry));
     new_entry->key = strdup(key);
-    new_entry->value = strdup(value);
-    new_entry->metadata = metadata;
+    new_entry->value = value;
+    new_entry->metadata = malloc(sizeof(metadata));
+    memcpy(new_entry->metadata, metadata_value, sizeof(metadata));
+    new_entry->value_type = value_type;
     new_entry->next = NULL;
     current->next = new_entry;
 }
@@ -108,7 +125,13 @@ void hashmap_delete_entry(hashmap* hashmap, const char* key) {
                     // Copy next into current
                     hashmap_entry* next = current->next;
                     free(current->key);
-                    free(current->value);
+
+                    if (current->value_type == TYPE_STRING) {
+                        free((char*) current->value);
+                    } else if (current->value_type == TYPE_LIST) {
+                        destroy_list((list*) current->value);
+                    }
+
                     free(current->metadata);
 
                     current->key = next->key;
@@ -119,7 +142,13 @@ void hashmap_delete_entry(hashmap* hashmap, const char* key) {
                 } else {
                     // Free head entry
                     free(current->key);
-                    free(current->value);
+
+                    if (current->value_type == TYPE_STRING) {
+                        free((char*) current->value);
+                    } else if (current->value_type == TYPE_LIST) {
+                        destroy_list((list*) current->value);
+                    }
+
                     free(current->metadata);
                     current->key = NULL;
                     current->value = NULL;
@@ -131,7 +160,13 @@ void hashmap_delete_entry(hashmap* hashmap, const char* key) {
             else {
                 prev->next = current->next;
                 free(current->key);
-                free(current->value);
+
+                if (current->value_type == TYPE_STRING) {
+                    free((char*) current->value);
+                } else if (current->value_type == TYPE_LIST) {
+                    destroy_list((list*) current->value);
+                }
+
                 free(current->metadata);
                 free(current);
             }
@@ -140,4 +175,18 @@ void hashmap_delete_entry(hashmap* hashmap, const char* key) {
         prev = current;
         current = current->next;
     }
+}
+
+hashmap_entry* hashmap_find_entry(hashmap* hashmap, const char* key) {
+    if (!hashmap || !key) return NULL;
+    size_t index = hash(key) % hashmap->capacity;
+    hashmap_entry* entry = &hashmap->entries[index];
+
+    while (entry) {
+        if (entry->key && strcmp(entry->key, key) == 0) {
+            return entry;
+        }
+        entry = entry->next;
+    }
+    return NULL;
 }
