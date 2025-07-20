@@ -10,29 +10,19 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/epoll.h>
+#include "hashmap.h"
 
 #define MAX_CLIENTS 10
+#define CAPACITY 1000
 
-// currently the implementation uses linked list, which is not efficient, i want to improve it by using hash table.
-struct key_value {
-    long long timestamp;
-    int time_to_live;
-    char* key;
-    char* value;
-    struct key_value* next;
-};
-
-typedef struct key_value key_value_t;
-key_value_t* head = NULL;
+hashmap map;
 
 void handle_input(char* buffer);
 void parse_input(char* buffer, char* command, char** arguments, int* argument_count, int* length);
 void set_key_value(char* key, char* value, char* buffer, char* option, int time_to_live);
 void get_key_value(char* key, char* buffer);
 void get_key_type(char* key, char* buffer);
-key_value_t* create_node(char* key, char* value, int time_to_live);
 void delete_key_value(char* key);
-void free_list();
 
 int main() {
 	// Disable output buffering
@@ -99,6 +89,9 @@ int main() {
 	int num_clients = 0;
 	int client_fds[MAX_CLIENTS];
 
+	// initialize hashmap
+	hashmap_create(&map, CAPACITY);
+
 	while(1) {
 	    // wait on the epoll-list
     	int epoll_event_count = epoll_wait(epoll_fd, events, MAX_CLIENTS, -1);
@@ -159,7 +152,7 @@ int main() {
 	}
 
 	close(server_fd);
-	free_list();
+	hashmap_destroy(&map);
 
 	return 0;
 }
@@ -206,121 +199,62 @@ void handle_input(char* buffer) {
         free(arguments[i]);
     }
 }
-// this function sets the key value pair in the linked list, for now ignoring the options value
+
+// this function sets the key value pair in the hashmap, for now ignoring the options value
 void set_key_value(char* key, char* value, char* buffer, char* options, int time_to_live) {
-    if(head == NULL) {
-        key_value_t* new_node = create_node(key, value, time_to_live);
-        if(new_node == NULL) {
-            strcpy(buffer, "-ERR out of memory\r\n");
-            return;
-        }
-        head = new_node;
-    } else {
-        key_value_t* current = head;
-        while(current != NULL) {
-            if(strcmp(current->key, key) == 0) {
-                free(current->value);
-                current->value = strdup(value);
-                if(current->value == NULL) {
-                    strcpy(buffer, "$-1\r\n");
-                    return;
-                }
-                strcpy(buffer, "+OK\r\n");
-                return;
-            }
-            current = current->next;
-        }
-        key_value_t* new_node = create_node(key, value, time_to_live);
-        if(new_node == NULL) {
-            strcpy(buffer, "$-1\r\n");
-            return;
-        }
-        new_node->next = head;
-        head = new_node;
+    metadata* meta = malloc(sizeof(metadata));
+    if (!meta) {
+        strcpy(buffer, "-ERR out of memory\r\n");
+        return;
     }
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    meta->timestamp = tv.tv_sec * 1000LL + tv.tv_usec / 1000LL;
+    meta->time_to_live = time_to_live;
+
+    hashmap_add_entry(&map, key, value, meta);
     strcpy(buffer, "+OK\r\n");
 }
 
-// we use this function to create a new node in the linked list
-key_value_t* create_node(char* key, char* value, int time_to_live) {
-    key_value_t* new_node = malloc(sizeof(key_value_t));
-    if(new_node == NULL) {
-        return NULL;
-    }
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    new_node->timestamp = tv.tv_sec * 1000LL + tv.tv_usec / 1000LL;
-    new_node->time_to_live = time_to_live;
-    new_node->key = strdup(key);
-    new_node->value = strdup(value);
-    new_node->next = NULL;
-    return new_node;
-}
-
-// we use this function to get the key value pair from the linked list, if it is expired then delete it and send -1.
 void get_key_value(char* key, char* buffer) {
-    key_value_t* current = head;
+    size_t index = hash(key) % map.capacity;
+    hashmap_entry* current = &map.entries[index];
     struct timeval now;
-    while(current != NULL) {
-        if(strcmp(current->key, key) == 0) {
-            if(current->time_to_live > 0) {
+
+    while (current != NULL && current->key != NULL) {
+        if (strcmp(current->key, key) == 0) {
+            if (current->metadata && current->metadata->time_to_live > 0) {
                 gettimeofday(&now, NULL);
-                long long elapsed = now.tv_sec * 1000LL + now.tv_usec / 1000LL - current->timestamp;
-                if(elapsed >= current->time_to_live) {
-                    delete_key_value(key);
+                long long elapsed = now.tv_sec * 1000LL + now.tv_usec / 1000LL - current->metadata->timestamp;
+                if (elapsed >= current->metadata->time_to_live) {
+                    hashmap_delete_entry(&map, key);
                     strcpy(buffer, "$-1\r\n");
                     return;
                 }
             }
+
             snprintf(buffer, 1024, "$%ld\r\n%s\r\n", strlen(current->value), current->value);
             return;
         }
         current = current->next;
     }
+
     strcpy(buffer, "$-1\r\n");
 }
 
 void get_key_type(char* key, char* buffer) {
-    get_key_value(key, buffer);
-    if (buffer[0] == '$' && buffer[1] != '-') {
+    char temp[1024];
+    get_key_value(key, temp);
+    if (temp[0] == '$' && temp[1] != '-') {
         strcpy(buffer, "+string\r\n");
     } else {
         strcpy(buffer, "+none\r\n");
     }
 }
 
-// we use this function to delete the key value pair from the linked list.
 void delete_key_value(char* key) {
-    key_value_t* current = head;
-    key_value_t* prev = NULL;
-    while(current != NULL) {
-        if (strcmp(current->key, key) == 0) {
-            if (prev == NULL) {
-                head = current->next;
-            } else {
-                prev->next = current->next;
-            }
-            free(current->key);
-            free(current->value);
-            free(current);
-            return;
-        }
-        prev = current;
-        current = current->next;
-    }
-}
-
-// we use this function to free the entire linked list.
-void free_list() {
-    key_value_t* current = head;
-    while(current != NULL) {
-        key_value_t* next = current->next;
-        free(current->key);
-        free(current->value);
-        free(current);
-        current = next;
-    }
-    head = NULL;
+    hashmap_delete_entry(&map, key);
 }
 
 // please refer here for RESP protocol specification:
