@@ -28,6 +28,8 @@ void delete_key_value(char* key);
 // these are for list operations
 void push_to_list(char* command, char* key, char** arguments, int arguments_count, char* buffer);
 void range_list(char* key, int start, int end, char* buffer);
+void get_list_length(char* key, char* buffer);
+void pop_from_list(char* key, int count, char* buffer);
 
 int main() {
 	// Disable output buffering
@@ -134,6 +136,7 @@ int main() {
                     buffer[bytes_read] = '\0';
                     printf("Client %d: %s\n", fd, buffer);
                     handle_input(buffer);
+                    printf("Server output: %s\n", buffer);
                     write(fd, buffer, strlen(buffer));
                 } else if(bytes_read == 0) {
                     printf("Client %d disconnected\n", i);
@@ -210,6 +213,20 @@ void handle_input(char* buffer) {
         } else {
             range_list(arguments[1], atoi(arguments[2]), atoi(arguments[3]), buffer);
         }
+    } else if (strcmp(command, "LLEN") == 0) {
+        if (arguments_count < 2) {
+            strcpy(buffer, "-ERR wrong number of arguments for 'llen' command\r\n");
+        } else {
+            get_list_length(arguments[1], buffer);
+        }
+    } else if (strcmp(command, "LPOP") == 0) {
+        if (arguments_count < 2) {
+            strcpy(buffer, "-ERR wrong number of arguments for 'lpop' command\r\n");
+        } else if (arguments_count == 2) {
+            pop_from_list(arguments[1], 1, buffer);
+        } else if (arguments_count == 3) {
+            pop_from_list(arguments[1], atoi(arguments[2]), buffer);
+        }
     }
 
     for(int i = 0; i < arguments_count; i++) {
@@ -261,7 +278,7 @@ void get_key_value(char* key, char* buffer) {
             }
 
             if (current->value_type == TYPE_STRING) {
-                snprintf(buffer, 1024, "$%ld\r\n%s\r\n", strlen(current->value), current->value);
+                snprintf(buffer, 1024, "$%ld\r\n%s\r\n", strlen(current->value),(char*) current->value);
                 return;
             } else if (current->value_type == TYPE_LIST) {
                 // do nothing for now
@@ -325,7 +342,6 @@ void push_to_list(char* command, char* key, char** arguments, int arguments_coun
         }
     }
 
-
     snprintf(buffer, 1024, ":%ld\r\n", push_list->size);
 }
 
@@ -343,6 +359,46 @@ void range_list(char* key, int start, int end, char* buffer) {
 
     get_values_array(push_list, start, end, temp);
     strcpy(buffer, temp);
+}
+
+void get_list_length(char* key, char* buffer) {
+    hashmap_entry* entry = hashmap_find_entry(&map, key);
+    if (entry != NULL && entry->value_type == TYPE_LIST) {
+        list* push_list = (list*) entry->value;
+        snprintf(buffer, 1024, ":%ld\r\n", push_list->size);
+    } else {
+        strcpy(buffer, ":0\r\n");
+    }
+}
+
+void pop_from_list(char* key, int count, char* buffer) {
+    if (count < 0) {
+        strcpy(buffer, "-ERR invalid count\r\n");
+    }
+
+    hashmap_entry* entry = hashmap_find_entry(&map, key);
+    if (entry != NULL && entry->value_type == TYPE_LIST) {
+        list* current_list = entry->value;
+        if (count >= current_list->size) {
+            count = current_list->size;
+        }
+
+        if (count == 0 || !current_list->head) {
+            strcpy(buffer, "$-1\r\n");
+        } else if (count == 1) {
+            dll* head = current_list->head;
+            snprintf(buffer, 1024, "$%ld\r\n%s\r\n", strlen(head->value),(char*) head->value);
+            delete_from_head(current_list);
+        } else {
+            get_values_array(current_list, 0, count - 1, buffer); // get all the values from the list
+
+            for(int i = 0; i < count; i++) { // delete the elements from the list
+                delete_from_head(current_list);
+            }
+        }
+    } else {
+        strcpy(buffer, "$-1\r\n");
+    }
 }
 
 // please refer here for RESP protocol specification:
