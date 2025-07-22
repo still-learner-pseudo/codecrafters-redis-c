@@ -12,13 +12,14 @@
 #include <sys/epoll.h>
 #include "hashmap.h"
 #include "double_linked_list.h"
+#include "blpop.h"
 
 #define MAX_CLIENTS 10
 #define CAPACITY 1000
 
 hashmap map;
 
-void handle_input(char* buffer);
+void handle_input(char* buffer, int fd);
 void parse_input(char* buffer, char* command, char** arguments, int* argument_count, int* length);
 // these are for key-value operations
 void set_key_value(char* key, char* value, char* buffer, char* option, int time_to_live);
@@ -30,6 +31,8 @@ void push_to_list(char* command, char* key, char** arguments, int arguments_coun
 void range_list(char* key, int start, int end, char* buffer);
 void get_list_length(char* key, char* buffer);
 void pop_from_list(char* key, int count, char* buffer);
+void blpop(char* key, int );
+
 
 int main() {
 	// Disable output buffering
@@ -98,14 +101,17 @@ int main() {
 
 	// initialize hashmap
 	hashmap_create(&map, CAPACITY);
+	blpop_waiting_clients = create_list();
 
 	while(1) {
 	    // wait on the epoll-list
-    	int epoll_event_count = epoll_wait(epoll_fd, events, MAX_CLIENTS, -1);
+    	int epoll_event_count = epoll_wait(epoll_fd, events, MAX_CLIENTS, 100); // wait for 100ms(added this for blpop)
         if (epoll_event_count == -1) {
             printf("epoll_wait failed: %s \n", strerror(errno));
             break;
         }
+
+        check_blpop_timeouts(); // check and remove expired clients
 
         for (int i = 0; i < epoll_event_count; i++) {
             int fd = events[i].data.fd;
@@ -135,9 +141,11 @@ int main() {
                 if(bytes_read > 0) {
                     buffer[bytes_read] = '\0';
                     printf("Client %d: %s\n", fd, buffer);
-                    handle_input(buffer);
+                    handle_input(buffer, fd);
                     printf("Server output: %s\n", buffer);
-                    write(fd, buffer, strlen(buffer));
+                    if(strlen(buffer) > 0) {
+                        write(fd, buffer, strlen(buffer));
+                    }
                 } else if(bytes_read == 0) {
                     printf("Client %d disconnected\n", i);
                     close(fd);
@@ -165,7 +173,7 @@ int main() {
 	return 0;
 }
 
-void handle_input(char* buffer) {
+void handle_input(char* buffer, int fd) {
     char command[100];
     char* arguments[100];
     int arguments_count = 0;
@@ -206,6 +214,7 @@ void handle_input(char* buffer) {
             strcpy(buffer, "-ERR wrong number of arguments for 'rpush' command\r\n");
         } else {
             push_to_list(command, arguments[1], arguments, arguments_count, buffer);
+            notify_blpop_clients(arguments[1]); // to handle BLPOP command
         }
     } else if (strcmp(command, "LRANGE") == 0) {
         if (arguments_count < 4) {
@@ -226,6 +235,17 @@ void handle_input(char* buffer) {
             pop_from_list(arguments[1], 1, buffer);
         } else if (arguments_count == 3) {
             pop_from_list(arguments[1], atoi(arguments[2]), buffer);
+        }
+    } else if (strcmp(command, "BLPOP") == 0) {
+        if (arguments_count < 3) {
+            strcpy(buffer, "-ERR wrong number of arguments for 'blpop' command\r\n");
+        } else if (arguments_count == 3) {
+            // handle the multiple client requests by blocking and serving the clients one by one in order
+            double timeout = atof(arguments[2]);
+            double timeout_sec = atof(arguments[2]);
+            int timeout_ms = (timeout_sec == 0.0) ? -1 : (int)(timeout_sec * 1000.0);
+            handle_blpop(arguments[1], fd, timeout_ms);
+            buffer[0] = '\0';
         }
     }
 
@@ -400,6 +420,7 @@ void pop_from_list(char* key, int count, char* buffer) {
         strcpy(buffer, "$-1\r\n");
     }
 }
+
 
 // please refer here for RESP protocol specification:
 // // https://redis.io/docs/latest/develop/reference/protocol-spec/
