@@ -13,6 +13,7 @@
 #include "hashmap.h"
 #include "double_linked_list.h"
 #include "blpop.h"
+#include "stream.h"
 
 #define MAX_CLIENTS 10
 #define CAPACITY 1000
@@ -33,6 +34,8 @@ void get_list_length(char* key, char* buffer);
 void pop_from_list(char* key, int count, char* buffer);
 void blpop(char* key, int );
 
+void add_to_stream(char* key, char* id, char* field, char* value, char* buffer);
+char* validate_id(char* id, char* top_id, long long* timestamp_ms, int* sequence_number, char* buffer);
 
 int main() {
 	// Disable output buffering
@@ -247,6 +250,12 @@ void handle_input(char* buffer, int fd) {
             handle_blpop(arguments[1], fd, timeout_ms);
             buffer[0] = '\0';
         }
+    } else if (strcmp(command, "XADD") == 0) {
+        if (arguments_count < 5) {
+            strcpy(buffer, "-ERR wrong number of arguments for 'xadd' command\r\n");
+        } else if (arguments_count >= 5 && arguments_count % 2 == 1) {
+            add_to_stream(arguments[1], arguments[2], arguments[3], arguments[4], buffer);
+        }
     }
 
     for(int i = 0; i < arguments_count; i++) {
@@ -314,12 +323,23 @@ void get_key_value(char* key, char* buffer) {
 }
 
 void get_key_type(char* key, char* buffer) {
-    char temp[1024];
-    get_key_value(key, temp);
-    if (temp[0] == '$' && temp[1] != '-') {
-        strcpy(buffer, "+string\r\n");
-    } else {
+    hashmap_entry* entry = hashmap_find_entry(&map, key);
+    if (entry == NULL) {
         strcpy(buffer, "+none\r\n");
+        return;
+    }
+    switch (entry->value_type) {
+        case TYPE_STRING:
+            strcpy(buffer, "+string\r\n");
+            break;
+        case TYPE_LIST:
+            strcpy(buffer, "+list\r\n");
+            break;
+        case TYPE_STREAM:
+            strcpy(buffer, "+stream\r\n");
+            break;
+        default:
+            strcpy(buffer, "+none\r\n");
     }
 }
 
@@ -421,6 +441,132 @@ void pop_from_list(char* key, int count, char* buffer) {
     }
 }
 
+void add_to_stream(char* key, char* id, char* field, char* value, char* buffer) {
+    hashmap_entry* entry = hashmap_find_entry(&map, key);
+    stream* s;
+    if (!entry) {
+        s = create_stream();
+        metadata* metadata_value = malloc(sizeof(metadata));
+        metadata_value->timestamp = 0;
+        metadata_value->time_to_live = -1;
+        hashmap_add_entry(&map, key, s, metadata_value, TYPE_STREAM);
+    } else {
+        if (entry->value_type != TYPE_STREAM) {
+            strcpy(buffer, "$-1\r\n");
+            return;
+        }
+        s = (stream*) entry->value;
+    }
+
+    char top_id[256] = "";
+    get_last_id(s, top_id);
+
+    long long timestamp_ms;
+    int sequence_number;
+    char* new_id = validate_id(id, top_id, &timestamp_ms, &sequence_number, buffer);
+
+    if (buffer[0] == '-' || !new_id) {
+        return;
+    }
+
+    char* fields[1] = { field };
+    char* values[1] = { value };
+    add_stream_entry(s, new_id, fields, values, 1);
+
+    snprintf(buffer, 1024, "$%ld\r\n%s\r\n", strlen(new_id), new_id);
+    free(new_id);
+}
+
+char* validate_id(char* id, char* top_id, long long* timestamp_ms, int* sequence_number, char* buffer) {
+    char* new_id = NULL;
+
+    new_id = malloc(256);
+    if (!new_id) {
+        strcpy(buffer, "-ERR Out of memory\r\n");
+        return NULL;
+    }
+
+    if (sscanf(id, "%lld-%d", timestamp_ms, sequence_number) == 2) {
+        if (*timestamp_ms == 0 && *sequence_number == 0) {
+            strcpy(buffer, "-ERR The ID specified in XADD must be greater than 0-0\r\n");
+            free(new_id);
+            return NULL;
+        }
+        if (top_id[0] != '\0') {
+            long long top_ts = -1;
+            int top_seq = -1;
+            sscanf(top_id, "%lld-%d", &top_ts, &top_seq);
+            if (*timestamp_ms < top_ts ||
+                (*timestamp_ms == top_ts && *sequence_number <= top_seq)) {
+                strcpy(buffer, "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n");
+                free(new_id);
+                return NULL;
+            }
+        }
+        sprintf(new_id, "%lld-%d", *timestamp_ms, *sequence_number);
+        return new_id;
+    }
+
+    if (sscanf(id, "%lld-%d", timestamp_ms, sequence_number) != 2) {
+        if (id[0] == '*') {
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            *timestamp_ms = tv.tv_sec * 1000 + tv.tv_usec / 1000;
+            *sequence_number = -1;
+        } else if (id[strlen(id) - 1] == '*') {
+            char ts_buf[256];
+            strncpy(ts_buf, id, strlen(id) - 1);
+            ts_buf[strlen(id) - 1] = '\0';
+            *timestamp_ms = atoll(ts_buf);
+
+            long long top_timestamp_ms = -1;
+            int top_sequence_number = -1;
+            if (top_id[0] != '\0') {
+                sscanf(top_id, "%lld-%d", &top_timestamp_ms, &top_sequence_number);
+            }
+
+            if (top_id[0] == '\0' || *timestamp_ms != top_timestamp_ms) {
+                *sequence_number = (*timestamp_ms == 0) ? 1 : 0;
+            } else {
+                *sequence_number = top_sequence_number + 1;
+            }
+        }
+
+    }
+
+
+    if (*timestamp_ms == 0 && *sequence_number == 0) {
+        strcpy(buffer, "-ERR The ID specified in XADD must be greater than 0-0\r\n");
+        return new_id;
+    }
+
+    if(top_id[0] == '\0') {
+        if (*timestamp_ms == 0) {
+            *sequence_number = 1;
+        } else {
+            *sequence_number = 0;
+        }
+        sprintf(new_id, "%lld-%d", *timestamp_ms, *sequence_number);
+        return new_id;
+    }
+
+    if(top_id[0] != '\0') {
+        long long top_timestamp_ms = -1;
+        int top_sequence_number = -1;
+        if (sscanf(top_id, "%lld-%d", &top_timestamp_ms, &top_sequence_number) != 2) {
+            strcpy(buffer, "-ERR Invalid top ID format\r\n");
+            return NULL;
+        }
+        if (*timestamp_ms < top_timestamp_ms || (*timestamp_ms == top_timestamp_ms && *sequence_number <= top_sequence_number)) {
+            strcpy(buffer, "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n");
+            return NULL;
+        }
+        sprintf(new_id, "%lld-%d", *timestamp_ms, *sequence_number);
+        return new_id;
+    }
+
+    return new_id;
+}
 
 // please refer here for RESP protocol specification:
 // // https://redis.io/docs/latest/develop/reference/protocol-spec/

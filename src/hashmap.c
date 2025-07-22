@@ -33,6 +33,8 @@ void hashmap_destroy(hashmap* hashmap) {
                 free((char*) current->value);
             } else if (current->value_type == TYPE_LIST) {
                 destroy_list((list*) current->value);
+            } else if (current->value_type == TYPE_STREAM) {
+                destroy_stream((stream*) current->value);
             }
 
             free(current->metadata);
@@ -84,7 +86,10 @@ void hashmap_add_entry(hashmap* hashmap, const char* key, void* value, metadata*
                 free((char*) current->value);
             } else if(current->value_type == TYPE_LIST) {
                 destroy_list((list*) current->value);
+            } else if(current->value_type == TYPE_STREAM) {
+                destroy_stream((stream*) current->value);
             }
+
             current->value = value;
             free(current->metadata);
             current->metadata = malloc(sizeof(metadata));
@@ -165,6 +170,8 @@ void hashmap_delete_entry(hashmap* hashmap, const char* key) {
                     free((char*) current->value);
                 } else if (current->value_type == TYPE_LIST) {
                     destroy_list((list*) current->value);
+                } else if(current->value_type == TYPE_STREAM) {
+                    destroy_stream((stream*) current->value);
                 }
 
                 free(current->metadata);

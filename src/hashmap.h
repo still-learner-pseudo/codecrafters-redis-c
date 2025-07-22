@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "double_linked_list.h"
+#include "stream.h"
 
 typedef struct {
     long long timestamp;
@@ -12,7 +13,8 @@ typedef struct {
 
 typedef enum  {
     TYPE_STRING,
-    TYPE_LIST
+    TYPE_LIST,
+    TYPE_STREAM
 } value_type;
 
 typedef struct hashmap_entry {
