@@ -36,6 +36,7 @@ void blpop(char* key, int );
 
 void add_to_stream(char* key, char* id, char* field, char* value, char* buffer);
 char* validate_id(char* id, char* top_id, long long* timestamp_ms, int* sequence_number, char* buffer);
+void range_from_stream(char* key, char* start_id, char* end_id, char* buffer);
 
 int main() {
 	// Disable output buffering
@@ -255,6 +256,12 @@ void handle_input(char* buffer, int fd) {
             strcpy(buffer, "-ERR wrong number of arguments for 'xadd' command\r\n");
         } else if (arguments_count >= 5 && arguments_count % 2 == 1) {
             add_to_stream(arguments[1], arguments[2], arguments[3], arguments[4], buffer);
+        }
+    } else if (strcmp(command, "XRANGE") == 0) {
+        if (arguments_count < 4) {
+            strcpy(buffer, "-ERR wrong number of arguments for 'xrange' command\r\n");
+        } else if (arguments_count == 4) {
+            range_from_stream(arguments[1], arguments[2], arguments[3], buffer);
         }
     }
 
@@ -566,6 +573,24 @@ char* validate_id(char* id, char* top_id, long long* timestamp_ms, int* sequence
     }
 
     return new_id;
+}
+
+void range_from_stream(char* key, char* start_id, char* end_id, char* buffer) {
+    hashmap_entry* entry = hashmap_find_entry(&map, key);
+    stream* s;
+    if (!entry) {
+        strcpy(buffer, "*0\r\n");
+        return;
+    } else {
+        if (entry->value_type != TYPE_STREAM) {
+            strcpy(buffer, "*0\r\n");
+            return;
+        }
+        s = entry->value;
+        get_stream_entries(s, start_id, end_id, buffer);
+    }
+
+    return;
 }
 
 // please refer here for RESP protocol specification:
