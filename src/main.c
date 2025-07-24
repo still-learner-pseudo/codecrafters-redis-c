@@ -37,6 +37,7 @@ void blpop(char* key, int );
 void add_to_stream(char* key, char* id, char* field, char* value, char* buffer);
 char* validate_id(char* id, char* top_id, long long* timestamp_ms, int* sequence_number, char* buffer);
 void range_from_stream(char* key, char* start_id, char* end_id, char* buffer);
+void xread_from_multiple_streams(char**arguments, int arguments_count, char* buffer);
 
 int main() {
 	// Disable output buffering
@@ -144,9 +145,9 @@ int main() {
                 ssize_t bytes_read = read(fd, buffer, sizeof(buffer));
                 if(bytes_read > 0) {
                     buffer[bytes_read] = '\0';
-                    printf("Client %d: %s\n", fd, buffer);
+                    // printf("Client %d: %s\n", fd, buffer);
                     handle_input(buffer, fd);
-                    printf("Server output: %s\n", buffer);
+                    // printf("Server output: %s\n", buffer);
                     if(strlen(buffer) > 0) {
                         write(fd, buffer, strlen(buffer));
                     }
@@ -262,6 +263,12 @@ void handle_input(char* buffer, int fd) {
             strcpy(buffer, "-ERR wrong number of arguments for 'xrange' command\r\n");
         } else if (arguments_count == 4) {
             range_from_stream(arguments[1], arguments[2], arguments[3], buffer);
+        }
+    } else if (strcmp(command, "XREAD") == 0) {
+        if (arguments_count < 4) {
+            strcpy(buffer, "-ERR wrong number of arguments for 'xread' command\r\n");
+        } else if (arguments_count >= 4 && arguments_count % 2 == 0) {
+            xread_from_multiple_streams(arguments, arguments_count - 2, buffer);
         }
     }
 
@@ -591,6 +598,40 @@ void range_from_stream(char* key, char* start_id, char* end_id, char* buffer) {
     }
 
     return;
+}
+
+void xread_from_multiple_streams(char** arguments, int argument_count, char* buffer) {
+    int num_streams = argument_count / 2;
+    char* keys[num_streams];
+    char* ids[num_streams];
+    for (int i = 0; i < num_streams; i++) { // we should skip the first two arguments which are XREAD and streams
+        keys[i] = arguments[i + 2];
+        ids[i] = arguments[i + num_streams + 2];
+    }
+
+    char temp[1024 * 16] = {0};
+    int stream_count = 0;
+
+    for (int i = 0; i < num_streams; i++) {
+        hashmap_entry* entry = hashmap_find_entry(&map, keys[i]);
+        if (!entry || entry->value_type != TYPE_STREAM) {
+            continue; // i am just skipping this stream and checking the next one
+        }
+        stream* s = (stream*) entry->value;
+
+        char stream_buffer[1024 * 8] = {0};
+        if (xread_stream_entries(s, ids[i], keys[i], stream_buffer)) {
+            strcat(temp, stream_buffer);
+            stream_count++;
+        }
+    }
+
+    if (stream_count == 0) {
+        strcpy(buffer, "*0\r\n");
+        return;
+    } else {
+        snprintf(buffer, 1024 * 16, "*%d\r\n%s", stream_count, temp);
+    }
 }
 
 // please refer here for RESP protocol specification:

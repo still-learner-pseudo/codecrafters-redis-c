@@ -1,7 +1,5 @@
 #include "stream.h"
 #include "double_linked_list.h"
-#include <iso646.h>
-#include <limits.h>
 
 stream* create_stream() {
     stream* s = malloc(sizeof(stream));
@@ -92,6 +90,7 @@ int compare_stream_id(long long time_ms1, int sequence1, long long time_ms2, int
 void get_stream_entries(stream* s, char* start_id, char* end_id, char* buffer) {
     long long start_time_ms, end_time_ms;
     int start_sequence, end_sequence;
+    int is_xread = 0;
     parse_stream_id(start_id, &start_time_ms, &start_sequence);
     parse_stream_id(end_id, &end_time_ms, &end_sequence);
 
@@ -122,5 +121,41 @@ void get_stream_entries(stream* s, char* start_id, char* end_id, char* buffer) {
         strcpy(buffer, "*0\r\n");
     } else {
         snprintf(buffer, 1024 * 8, "*%d\r\n%s", count, temp);
+    }
+}
+
+int xread_stream_entries(stream* s, char* start_id, const char* key, char* buffer) {
+    long long start_time_ms, end_time_ms;
+    int start_sequence, end_sequence;
+    parse_stream_id(start_id, &start_time_ms, &start_sequence);
+
+    stream_entry* entry = s->head;
+    int count = 0;
+    char temp[1024 * 8] = {0};
+
+    while (entry) {
+        long long entry_time;
+        int entry_sequence;
+        parse_stream_id(entry->id, &entry_time, &entry_sequence);
+
+        if (compare_stream_id(entry_time, entry_sequence, start_time_ms, start_sequence) > 0) {
+            char entry_buf[1024] = {0};
+            int n = snprintf(entry_buf, sizeof(entry_buf), "*2\r\n$%ld\r\n%s\r\n*%d\r\n", strlen(entry->id), entry->id, 2 * entry->num_fields);
+            for (int i = 0; i < entry->num_fields; i++) {
+                n += snprintf(entry_buf + n, sizeof(entry_buf) - n, "$%ld\r\n%s\r\n$%ld\r\n%s\r\n",
+                    strlen(entry->fields[i]), entry->fields[i], strlen(entry->values[i]), entry->values[i]);
+            }
+            strcat(temp, entry_buf);
+            count++;
+        }
+        entry = entry->next;
+    }
+
+    if (count == 0) {
+        buffer[0] = '\0';
+        return 0;
+    } else {
+        snprintf(buffer, 1024 * 8, "*2\r\n$%ld\r\n%s\r\n*%d\r\n%s", strlen(key), key, count, temp);
+        return 1;
     }
 }

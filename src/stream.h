@@ -26,5 +26,6 @@ void get_last_id(stream* s, char* id);
 void parse_stream_id(char* id, long long* time_ms, int* sequence);
 int compare_stream_id(long long time_ms1, int sequence1, long long time_ms2, int sequence2);
 void get_stream_entries(stream* s, char* start_id, char* end_id, char* buffer);
+int xread_stream_entries(stream* s, char* start_id, const char* key, char* buffer);
 
 #endif
