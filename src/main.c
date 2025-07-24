@@ -1,19 +1,17 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/socket.h>
-#include <sys/select.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>
-#include <string.h>
-#include <errno.h>
-#include <time.h>
-#include <unistd.h>
-#include <sys/time.h>
-#include <sys/epoll.h>
 #include "hashmap.h"
 #include "double_linked_list.h"
-#include "blpop.h"
 #include "stream.h"
+#include "blocking_wait.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <sys/time.h>
 
 #define MAX_CLIENTS 10
 #define CAPACITY 1000
@@ -37,7 +35,7 @@ void blpop(char* key, int );
 void add_to_stream(char* key, char* id, char* field, char* value, char* buffer);
 char* validate_id(char* id, char* top_id, long long* timestamp_ms, int* sequence_number, char* buffer);
 void range_from_stream(char* key, char* start_id, char* end_id, char* buffer);
-void xread_from_multiple_streams(char**arguments, int arguments_count, char* buffer);
+void xread_from_multiple_streams(char**arguments, int arguments_count, char* buffer, int fd);
 
 int main() {
 	// Disable output buffering
@@ -107,6 +105,7 @@ int main() {
 	// initialize hashmap
 	hashmap_create(&map, CAPACITY);
 	blpop_waiting_clients = create_list();
+	xread_waiting_clients = create_list();
 
 	while(1) {
 	    // wait on the epoll-list
@@ -117,6 +116,7 @@ int main() {
         }
 
         check_blpop_timeouts(); // check and remove expired clients
+        check_xread_timeouts(); // check and remove expired clients
 
         for (int i = 0; i < epoll_event_count; i++) {
             int fd = events[i].data.fd;
@@ -257,6 +257,7 @@ void handle_input(char* buffer, int fd) {
             strcpy(buffer, "-ERR wrong number of arguments for 'xadd' command\r\n");
         } else if (arguments_count >= 5 && arguments_count % 2 == 1) {
             add_to_stream(arguments[1], arguments[2], arguments[3], arguments[4], buffer);
+            notify_xread_clients(arguments[1]); // notify the blocked clients of the new entry
         }
     } else if (strcmp(command, "XRANGE") == 0) {
         if (arguments_count < 4) {
@@ -268,7 +269,7 @@ void handle_input(char* buffer, int fd) {
         if (arguments_count < 4) {
             strcpy(buffer, "-ERR wrong number of arguments for 'xread' command\r\n");
         } else if (arguments_count >= 4 && arguments_count % 2 == 0) {
-            xread_from_multiple_streams(arguments, arguments_count - 2, buffer);
+            xread_from_multiple_streams(arguments, arguments_count - 2, buffer, fd);
         }
     }
 
@@ -600,13 +601,41 @@ void range_from_stream(char* key, char* start_id, char* end_id, char* buffer) {
     return;
 }
 
-void xread_from_multiple_streams(char** arguments, int argument_count, char* buffer) {
+void xread_from_multiple_streams(char** arguments, int argument_count, char* buffer, int fd) {
     int num_streams = argument_count / 2;
     char* keys[num_streams];
     char* ids[num_streams];
-    for (int i = 0; i < num_streams; i++) { // we should skip the first two arguments which are XREAD and streams
-        keys[i] = arguments[i + 2];
-        ids[i] = arguments[i + num_streams + 2];
+    if (strcmp(arguments[1], "block") == 0) {
+        num_streams--; // because we should remove the pair of block and timeout
+        int timeout = atoi(arguments[2]);
+        if (timeout < 0) {
+            strcpy(buffer, "*0\r\n");
+            return;
+        } else if (timeout == 0) {
+            timeout = -1;
+        }
+        for (int i = 0; i < num_streams; i++) { // we should skip the first 4 arguments which are XREAD, block, timeout and streams
+            keys[i] = arguments[i + 4];
+            if (strcmp(arguments[i + num_streams + 4], "$") == 0) {
+                hashmap_entry* entry = hashmap_find_entry(&map, keys[i]);
+                char* max_id = "0-0";
+                if (entry && entry->value_type == TYPE_STREAM) {
+                    stream* s = (stream*) entry->value;
+                    if (s->tail) max_id = s->tail->id;
+                }
+                ids[i] = strdup(max_id);
+            } else {
+                ids[i] = arguments[i + num_streams + 4];
+            }
+        }
+        handle_xread_block(keys, ids, num_streams, fd, timeout);
+        buffer[0] = '\0';
+        return;
+    } else {
+        for (int i = 0; i < num_streams; i++) { // we should skip the first 2 arguments which are XREAD and streams
+            keys[i] = arguments[i + 2];
+            ids[i] = arguments[i + num_streams + 2];
+        }
     }
 
     char temp[1024 * 16] = {0};
