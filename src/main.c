@@ -2,6 +2,9 @@
 #include "double_linked_list.h"
 #include "stream.h"
 #include "blocking_wait.h"
+#include "client.h"
+#include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,41 +15,50 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <sys/time.h>
+#include <strings.h>
 
 #define MAX_CLIENTS 10
 #define CAPACITY 1000
 
+// --- Global Variables ---
 hashmap map;
+client* client_head = NULL;
 
-void handle_input(char* buffer, int fd);
+// --- Function Prototypes ---
+void handle_input(char* request, client* client, char* response);
 void parse_input(char* buffer, char* command, char** arguments, int* argument_count, int* length);
+
 // these are for key-value operations
 void set_key_value(char* key, char* value, char* buffer, char* option, int time_to_live);
 void get_key_value(char* key, char* buffer);
 void get_key_type(char* key, char* buffer);
 void delete_key_value(char* key);
+
 // these are for list operations
 void push_to_list(char* command, char* key, char** arguments, int arguments_count, char* buffer);
 void range_list(char* key, int start, int end, char* buffer);
 void get_list_length(char* key, char* buffer);
 void pop_from_list(char* key, int count, char* buffer);
-void blpop(char* key, int );
 
-void add_to_stream(char* key, char* id, char* field, char* value, char* buffer);
+// these are for stream operations
+void add_to_stream(char* key, char* id, char** field_value_pairs, int num_pairs, char* buffer);
 char* validate_id(char* id, char* top_id, long long* timestamp_ms, int* sequence_number, char* buffer);
 void range_from_stream(char* key, char* start_id, char* end_id, char* buffer);
 void xread_from_multiple_streams(char**arguments, int arguments_count, char* buffer, int fd);
 
+// these are for incr operations
+void incr_key(char* key, char* buffer);
+
+// these are for MULTI_EXEC_DISCARD
+void handle_exec_command(client* client, char* buffer);
+void handle_discard_command(client* client, char* buffer);
+void handle_queue_command(client* client, char* request, char* response);
+
 int main() {
-	// Disable output buffering
 	setbuf(stdout, NULL);
 	setbuf(stderr, NULL);
-
-	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	printf("Logs from your program will appear here!\n");
 
-	// Uncomment this block to pass the first stage
-	//
 	int server_fd;
 	socklen_t client_addr_len;
 	struct sockaddr_in client_addr;
@@ -57,8 +69,6 @@ int main() {
 		return 1;
 	}
 
-	// Since the tester restarts your program quite often, setting SO_REUSEADDR
-	// ensures that we don't run into 'Address already in use' errors
 	int reuse = 1;
 	if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
 		printf("SO_REUSEADDR failed: %s \n", strerror(errno));
@@ -75,8 +85,7 @@ int main() {
 		return 1;
 	}
 
-	int connection_backlog = 5;
-	if (listen(server_fd, connection_backlog) != 0) {
+	if (listen(server_fd, 5) != 0) {
 		printf("Listen failed: %s \n", strerror(errno));
 		return 1;
 	}
@@ -90,8 +99,7 @@ int main() {
 		return 1;
 	}
 
-	// add the server socket to the epoll-list
-	struct epoll_event ev, events[MAX_CLIENTS];
+	struct epoll_event ev, events[MAX_CLIENTS + 1];
 	ev.events = EPOLLIN;
     ev.data.fd = server_fd;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) == -1) {
@@ -99,74 +107,65 @@ int main() {
         return 1;
     }
 
-	int num_clients = 0;
-	int client_fds[MAX_CLIENTS];
-
-	// initialize hashmap
 	hashmap_create(&map, CAPACITY);
 	blpop_waiting_clients = create_list();
 	xread_waiting_clients = create_list();
 
 	while(1) {
-	    // wait on the epoll-list
-    	int epoll_event_count = epoll_wait(epoll_fd, events, MAX_CLIENTS, 100); // wait for 100ms(added this for blpop)
+    	int epoll_event_count = epoll_wait(epoll_fd, events, MAX_CLIENTS + 1, 100);
         if (epoll_event_count == -1) {
             printf("epoll_wait failed: %s \n", strerror(errno));
             break;
         }
 
-        check_blpop_timeouts(); // check and remove expired clients
-        check_xread_timeouts(); // check and remove expired clients
+        check_blpop_timeouts();
+        check_xread_timeouts();
 
         for (int i = 0; i < epoll_event_count; i++) {
             int fd = events[i].data.fd;
             if(fd == server_fd) {
                 int new_client_fd = accept(server_fd, (struct sockaddr*) &client_addr, &client_addr_len);
                 if(new_client_fd > 0) {
-                    if(num_clients < MAX_CLIENTS) {
-                        printf("Client %d Connected\n", num_clients);
-                        client_fds[num_clients++] = new_client_fd;
+                    printf("Client %d Connected\n", new_client_fd);
+                    client* new_client = create_client(new_client_fd);
+                    add_client(&client_head, new_client);
 
-                        // add the new client also to the epoll-list
-                        ev.events = EPOLLIN;
-                        ev.data.fd = new_client_fd;
-                        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &ev) == -1) {
-                            printf("epoll_ctl: client_fd failed: %s\n", strerror(errno));
-                            close(new_client_fd);
-                            continue;
-                        }
-                    } else {
-                        printf("Maximum number of clients reached\n");
+                    ev.events = EPOLLIN;
+                    ev.data.fd = new_client_fd;
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_fd, &ev) == -1) {
+                        printf("epoll_ctl: client_fd failed: %s\n", strerror(errno));
                         close(new_client_fd);
                     }
                 }
             } else {
-                char buffer[1024];
-                ssize_t bytes_read = read(fd, buffer, sizeof(buffer));
+                char temp_buffer[1024];
+                ssize_t bytes_read = read(fd, temp_buffer, sizeof(temp_buffer) - 1);
                 if(bytes_read > 0) {
-                    buffer[bytes_read] = '\0';
-                    // printf("Client %d: %s\n", fd, buffer);
-                    handle_input(buffer, fd);
-                    // printf("Server output: %s\n", buffer);
-                    if(strlen(buffer) > 0) {
-                        write(fd, buffer, strlen(buffer));
+                    temp_buffer[bytes_read] = '\0';
+
+                    client* c = find_client(fd, client_head);
+                    if (!c) {
+                        printf("Error: Client %d not found\n", fd);
+                        continue;
                     }
-                } else if(bytes_read == 0) {
-                    printf("Client %d disconnected\n", i);
+
+                    char* response = malloc(1024 * 8);
+                    response[0] = '\0';
+
+                    handle_input(temp_buffer, c, response);
+
+                    if(strlen(response) > 0) {
+                        printf("Sending response to client %d: %s\n", fd, response);
+                        write(fd, response, strlen(response));
+                    }
+                    free(response);
+                } else {
+                    printf("Client %d disconnected\n", fd);
                     close(fd);
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-
-                    for(int j = 0; j < num_clients; j++) {
-                        if(client_fds[j] == fd) {
-                            for (int k = j; k < num_clients - 1; k++) {
-                                client_fds[k] = client_fds[k + 1];
-                            }
-                            num_clients--;
-                            break;
-                        }
-                    }
-                } else {
-                    printf("Error reading from client %d: %s\n", fd, strerror(errno));
+                    remove_blpop_client(fd);
+                    remove_xread_client(fd);
+                    remove_and_destroy_client(fd, &client_head);
                 }
             }
         }
@@ -174,167 +173,186 @@ int main() {
 
 	close(server_fd);
 	hashmap_destroy(&map);
-
+    destroy_all_clients(&client_head);
 	return 0;
 }
 
-void handle_input(char* buffer, int fd) {
-    char command[100];
+void handle_input(char* request, client* client, char* response) {
+    char command[100] = {0};
     char* arguments[100];
     int arguments_count = 0;
     int length = 0;
-    parse_input(buffer, command, arguments, &arguments_count, &length);
+    parse_input(request, command, arguments, &arguments_count, &length);
 
-    if (strcmp(command, "PING") == 0) {
-            strcpy(buffer, "+PONG\r\n"); // this is simple without any formatting.
-    } else if (strcmp(command, "ECHO") == 0) {
-        if (arguments_count < 2) { // if there are less than 2 arguments that means only the command ECHO was sent
-            strcpy(buffer, "-ERR wrong number of arguments for 'echo' command\r\n");
-        } else {
-            snprintf(buffer, 1024, "$%ld\r\n%s\r\n", strlen(arguments[1]), arguments[1]); // we need of the form $<length>\r\n<value>\r\n
-        }
-    } else if (strcmp(command, "SET") == 0) {
-        if (arguments_count < 3) { // if there are less than 3 arguments that means only the command SET and key was sent, value is missing
-            strcpy(buffer, "-ERR wrong number of arguments for 'set' command\r\n");
-        } else {
-            if(arguments_count == 5)
-                set_key_value(arguments[1], arguments[2], buffer, arguments[3], atoi(arguments[4]));
-            else
-                set_key_value(arguments[1], arguments[2], buffer, NULL, -1);
-        }
-    } else if (strcmp(command, "GET") == 0) {
-        if (arguments_count < 2) { // if there are less than 2 arguments that means only the command GET was sent, key is missing
-            strcpy(buffer, "-ERR wrong number of arguments for 'get' command\r\n");
-        } else {
-            get_key_value(arguments[1], buffer);
-        }
-    } else if (strcmp(command, "TYPE") == 0) {
-        if (arguments_count < 2) { // if there are less than 2 arguments that means only the command TYPE was sent, key is missing
-            strcpy(buffer, "-ERR wrong number of arguments for 'type' command\r\n");
-        } else {
-            get_key_type(arguments[1], buffer);
-        }
-    } else if ((strcmp(command, "RPUSH") == 0) || (strcmp(command, "LPUSH") == 0)) {
-        if (arguments_count < 3) {
-            strcpy(buffer, "-ERR wrong number of arguments for 'rpush' command\r\n");
-        } else {
-            push_to_list(command, arguments[1], arguments, arguments_count, buffer);
-            notify_blpop_clients(arguments[1]); // to handle BLPOP command
-        }
-    } else if (strcmp(command, "LRANGE") == 0) {
-        if (arguments_count < 4) {
-            strcpy(buffer, "-ERR wrong number of arguments for 'lrange' command\r\n");
-        } else {
-            range_list(arguments[1], atoi(arguments[2]), atoi(arguments[3]), buffer);
-        }
-    } else if (strcmp(command, "LLEN") == 0) {
-        if (arguments_count < 2) {
-            strcpy(buffer, "-ERR wrong number of arguments for 'llen' command\r\n");
-        } else {
-            get_list_length(arguments[1], buffer);
-        }
-    } else if (strcmp(command, "LPOP") == 0) {
-        if (arguments_count < 2) {
-            strcpy(buffer, "-ERR wrong number of arguments for 'lpop' command\r\n");
-        } else if (arguments_count == 2) {
-            pop_from_list(arguments[1], 1, buffer);
-        } else if (arguments_count == 3) {
-            pop_from_list(arguments[1], atoi(arguments[2]), buffer);
-        }
-    } else if (strcmp(command, "BLPOP") == 0) {
-        if (arguments_count < 3) {
-            strcpy(buffer, "-ERR wrong number of arguments for 'blpop' command\r\n");
-        } else if (arguments_count == 3) {
-            // handle the multiple client requests by blocking and serving the clients one by one in order
-            double timeout = atof(arguments[2]);
-            double timeout_sec = atof(arguments[2]);
-            int timeout_ms = (timeout_sec == 0.0) ? -1 : (int)(timeout_sec * 1000.0);
-            handle_blpop(arguments[1], fd, timeout_ms);
-            buffer[0] = '\0';
-        }
-    } else if (strcmp(command, "XADD") == 0) {
-        if (arguments_count < 5) {
-            strcpy(buffer, "-ERR wrong number of arguments for 'xadd' command\r\n");
-        } else if (arguments_count >= 5 && arguments_count % 2 == 1) {
-            add_to_stream(arguments[1], arguments[2], arguments[3], arguments[4], buffer);
-            notify_xread_clients(arguments[1]); // notify the blocked clients of the new entry
-        }
-    } else if (strcmp(command, "XRANGE") == 0) {
-        if (arguments_count < 4) {
-            strcpy(buffer, "-ERR wrong number of arguments for 'xrange' command\r\n");
-        } else if (arguments_count == 4) {
-            range_from_stream(arguments[1], arguments[2], arguments[3], buffer);
-        }
-    } else if (strcmp(command, "XREAD") == 0) {
-        if (arguments_count < 4) {
-            strcpy(buffer, "-ERR wrong number of arguments for 'xread' command\r\n");
-        } else if (arguments_count >= 4 && arguments_count % 2 == 0) {
-            xread_from_multiple_streams(arguments, arguments_count - 2, buffer, fd);
-        }
+    if (arguments_count == 0) {
+        goto cleanup;
     }
 
+    response[0] = '\0';
+
+    if (client->in_multi) {
+        if (strcasecmp(command, "EXEC") == 0) {
+            handle_exec_command(client, response);
+        } else if (strcasecmp(command, "DISCARD") == 0) {
+            handle_discard_command(client, response);
+        } else if (strcasecmp(command, "MULTI") == 0) {
+            strcpy(response, "-ERR MULTI calls can not be nested\r\n");
+        } else {
+            handle_queue_command(client, request, response);
+        }
+        goto cleanup;
+    }
+
+    if (strcasecmp(command, "PING") == 0) {
+        strcpy(response, "+PONG\r\n");
+    } else if (strcasecmp(command, "ECHO") == 0) {
+        if (arguments_count < 2) {
+            strcpy(response, "-ERR wrong number of arguments for 'echo' command\r\n");
+        } else {
+            snprintf(response, 1024, "$%ld\r\n%s\r\n", strlen(arguments[1]), arguments[1]);
+        }
+    } else if (strcasecmp(command, "SET") == 0) {
+        if (arguments_count < 3) {
+            strcpy(response, "-ERR wrong number of arguments for 'set' command\r\n");
+        } else {
+            if(arguments_count == 5 && strcasecmp(arguments[3], "px") == 0)
+                set_key_value(arguments[1], arguments[2], response, arguments[3], atoi(arguments[4]));
+            else
+                set_key_value(arguments[1], arguments[2], response, NULL, -1);
+        }
+    } else if (strcasecmp(command, "GET") == 0) {
+        get_key_value(arguments[1], response);
+    } else if (strcasecmp(command, "TYPE") == 0) {
+        get_key_type(arguments[1], response);
+    } else if (strcasecmp(command, "RPUSH") == 0 || strcasecmp(command, "LPUSH") == 0) {
+        if(arguments_count < 3) strcpy(response, "-ERR wrong number of arguments\r\n");
+        else {
+            push_to_list(command, arguments[1], arguments, arguments_count, response);
+            notify_blpop_clients(arguments[1]);
+        }
+    } else if (strcasecmp(command, "LRANGE") == 0) {
+        if(arguments_count < 4) strcpy(response, "-ERR wrong number of arguments\r\n");
+        else range_list(arguments[1], atoi(arguments[2]), atoi(arguments[3]), response);
+    } else if (strcasecmp(command, "LLEN") == 0) {
+        if(arguments_count < 2) strcpy(response, "-ERR wrong number of arguments\r\n");
+        else get_list_length(arguments[1], response);
+    } else if (strcasecmp(command, "LPOP") == 0) {
+        if(arguments_count < 2) strcpy(response, "-ERR wrong number of arguments\r\n");
+        else pop_from_list(arguments[1], (arguments_count > 2) ? atoi(arguments[2]) : 1, response);
+    } else if (strcasecmp(command, "BLPOP") == 0) {
+        if(arguments_count < 3) strcpy(response, "-ERR wrong number of arguments\r\n");
+        else {
+            double timeout_sec = atof(arguments[arguments_count - 1]);
+            int timeout_ms = (int)(timeout_sec * 1000.0);
+            if (timeout_sec == 0) timeout_ms = -1;
+            handle_blpop(arguments[1], client->fd, timeout_ms);
+            response[0] = '\0';
+        }
+    } else if (strcasecmp(command, "XADD") == 0) {
+            // The number of arguments must be odd and at least 5 (XADD key id field value)
+            if (arguments_count < 5 || arguments_count % 2 != 1) {
+                 strcpy(response, "-ERR wrong number of arguments for 'xadd' command\r\n");
+            } else {
+                // Pass the key, id, and then a pointer to the start of the field/value pairs
+                // and the number of pairs.
+                int num_pairs = (arguments_count - 3) / 2;
+                add_to_stream(arguments[1], arguments[2], &arguments[3], num_pairs, response);
+                notify_xread_clients(arguments[1]); // Notify blocked clients
+            }
+    } else if (strcasecmp(command, "XRANGE") == 0) {
+        if (arguments_count < 4) strcpy(response, "-ERR wrong number of arguments\r\n");
+        else range_from_stream(arguments[1], arguments[2], arguments[3], response);
+    } else if (strcasecmp(command, "XREAD") == 0) {
+        if (arguments_count < 4) strcpy(response, "-ERR wrong number of arguments\r\n");
+        else xread_from_multiple_streams(arguments, arguments_count, response, client->fd);
+    } else if (strcasecmp(command, "INCR") == 0) {
+        if (arguments_count < 2) strcpy(response, "-ERR wrong number of arguments\r\n");
+        else incr_key(arguments[1], response);
+    } else if (strcasecmp(command, "MULTI") == 0) {
+        client->in_multi = 1;
+        strcpy(response, "+OK\r\n");
+    } else if (strcasecmp(command, "EXEC") == 0) {
+        strcpy(response, "-ERR EXEC without MULTI\r\n");
+    } else if (strcasecmp(command, "DISCARD") == 0) {
+        strcpy(response, "-ERR DISCARD without MULTI\r\n");
+    } else {
+        strcpy(response, "-ERR unknown command\r\n");
+    }
+
+cleanup:
     for(int i = 0; i < arguments_count; i++) {
         free(arguments[i]);
     }
 }
 
-// this function sets the key value pair in the hashmap, for now ignoring the options value
+void handle_queue_command(client* client, char* request, char* response) {
+    if (!client) return;
+    add_command_to_queue(client, request);
+    strcpy(response, "+QUEUED\r\n");
+}
+
+void handle_discard_command(client* client, char* response) {
+    if (!client) return;
+    clear_command_queue(client);
+    client->in_multi = 0;
+    strcpy(response, "+OK\r\n");
+}
+
+void handle_exec_command(client* client, char* response) {
+    if (!client) {
+        strcpy(response, "-ERR client error\r\n");
+        return;
+    }
+    int num_commands = client->command_count;
+    int offset = sprintf(response, "*%d\r\n", num_commands);
+    client->in_multi = 0;
+    queued_buffer* current = client->queued_commands;
+    while(current != NULL) {
+        char temp_response[1024 * 2] = {0};
+        handle_input(current->buffer, client, temp_response);
+        offset += sprintf(response + offset, "%s", temp_response);
+        current = current->next;
+    }
+    clear_command_queue(client);
+}
+
 void set_key_value(char* key, char* value, char* buffer, char* options, int time_to_live) {
     metadata* metadata_value = malloc(sizeof(metadata));
     if (!metadata_value) {
         strcpy(buffer, "-ERR out of memory\r\n");
         return;
     }
-
     struct timeval tv;
     gettimeofday(&tv, NULL);
     metadata_value->timestamp = tv.tv_sec * 1000LL + tv.tv_usec / 1000LL;
     metadata_value->time_to_live = time_to_live;
-
     char* value_copy = strdup(value);
-    if (!value_copy) {
-        strcpy(buffer, "-ERR out of memory\r\n");
-        free(metadata_value);
-        return;
-    }
-
-    hashmap_add_entry(&map, key,(void*) value_copy, metadata_value, TYPE_STRING);
+    hashmap_add_entry(&map, key, (void*) value_copy, metadata_value, TYPE_STRING);
     strcpy(buffer, "+OK\r\n");
-
     free(metadata_value);
 }
 
 void get_key_value(char* key, char* buffer) {
-    size_t index = hash(key) % map.capacity;
-    hashmap_entry* current = &map.entries[index];
-    struct timeval now;
-
-    while (current != NULL && current->key != NULL) {
-        if (strcmp(current->key, key) == 0) {
-            if (current->metadata && current->metadata->time_to_live > 0) {
-                gettimeofday(&now, NULL);
-                long long elapsed = now.tv_sec * 1000LL + now.tv_usec / 1000LL - current->metadata->timestamp;
-                if (elapsed >= current->metadata->time_to_live) {
-                    hashmap_delete_entry(&map, key);
-                    strcpy(buffer, "$-1\r\n");
-                    return;
-                }
-            }
-
-            if (current->value_type == TYPE_STRING) {
-                snprintf(buffer, 1024, "$%ld\r\n%s\r\n", strlen(current->value),(char*) current->value);
-                return;
-            } else if (current->value_type == TYPE_LIST) {
-                // do nothing for now
-                return;
-            } else {
-                strcpy(buffer, "$-1\r\n");
-            }
-        }
-        current = current->next;
+    hashmap_entry* entry = hashmap_find_entry(&map, key);
+    if (!entry) {
+        strcpy(buffer, "$-1\r\n");
+        return;
     }
-
-    strcpy(buffer, "$-1\r\n");
+    if (entry->metadata && entry->metadata->time_to_live > 0) {
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        long long elapsed = now.tv_sec * 1000LL + now.tv_usec / 1000LL - entry->metadata->timestamp;
+        if (elapsed >= entry->metadata->time_to_live) {
+            hashmap_delete_entry(&map, key);
+            strcpy(buffer, "$-1\r\n");
+            return;
+        }
+    }
+    if (entry->value_type == TYPE_STRING) {
+        snprintf(buffer, 1024, "$%ld\r\n%s\r\n", strlen(entry->value), (char*)entry->value);
+    } else {
+        strcpy(buffer, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    }
 }
 
 void get_key_type(char* key, char* buffer) {
@@ -344,17 +362,10 @@ void get_key_type(char* key, char* buffer) {
         return;
     }
     switch (entry->value_type) {
-        case TYPE_STRING:
-            strcpy(buffer, "+string\r\n");
-            break;
-        case TYPE_LIST:
-            strcpy(buffer, "+list\r\n");
-            break;
-        case TYPE_STREAM:
-            strcpy(buffer, "+stream\r\n");
-            break;
-        default:
-            strcpy(buffer, "+none\r\n");
+        case TYPE_STRING: strcpy(buffer, "+string\r\n"); break;
+        case TYPE_LIST: strcpy(buffer, "+list\r\n"); break;
+        case TYPE_STREAM: strcpy(buffer, "+stream\r\n"); break;
+        default: strcpy(buffer, "+none\r\n");
     }
 }
 
@@ -365,78 +376,49 @@ void delete_key_value(char* key) {
 void push_to_list(char* command, char* key, char** arguments, int arguments_count, char* buffer) {
     hashmap_entry* entry = hashmap_find_entry(&map, key);
     list* push_list;
-
     if (entry == NULL) {
         push_list = create_list();
-        if (!push_list) {
-            strcpy(buffer, "-ERR\r\n");
-            return;
-        }
-        metadata* metadata_value = malloc(sizeof(metadata));
-        metadata_value->timestamp = 0;
-        metadata_value->time_to_live = -1;
-
-        hashmap_add_entry(&map, key, push_list, metadata_value, TYPE_LIST);
+        metadata* md = malloc(sizeof(metadata));
+        md->timestamp = 0; md->time_to_live = -1;
+        hashmap_add_entry(&map, key, push_list, md, TYPE_LIST);
     } else {
         if (entry->value_type != TYPE_LIST) {
-            strcpy(buffer, "-ERR\r\n");
+            strcpy(buffer, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
             return;
         }
         push_list = (list*)entry->value;
     }
-
-    if (strcmp(command, "RPUSH") == 0 ) {
-        for(int i = 2; i < arguments_count; i++) { // skip first two arguments i.e command and key
-            char* val = strdup(arguments[i]);
-            append_to_list(push_list, (void*) val);
-        }
-    } else if (strcmp(command, "LPUSH") == 0) {
-        for(int i = 2; i < arguments_count; i++) { // skip first two arguments i.e command and key
-            char* val = strdup(arguments[i]);
-            prepend_to_list(push_list, (void*) val);
-        }
+    for(int i = 2; i < arguments_count; i++) {
+        char* val = strdup(arguments[i]);
+        if (strcasecmp(command, "RPUSH") == 0) append_to_list(push_list, (void*) val);
+        else prepend_to_list(push_list, (void*) val);
     }
-
     snprintf(buffer, 1024, ":%ld\r\n", push_list->size);
 }
 
 void range_list(char* key, int start, int end, char* buffer) {
-    char temp[1024];
     hashmap_entry* entry = hashmap_find_entry(&map, key);
-    list* push_list = NULL;
-
     if (entry != NULL && entry->value_type == TYPE_LIST) {
-        push_list = (list*) entry->value;
+        get_values_array((list*)entry->value, start, end, buffer);
     } else {
         strcpy(buffer, "*0\r\n");
-        return;
     }
-
-    get_values_array(push_list, start, end, temp);
-    strcpy(buffer, temp);
 }
 
 void get_list_length(char* key, char* buffer) {
     hashmap_entry* entry = hashmap_find_entry(&map, key);
     if (entry != NULL && entry->value_type == TYPE_LIST) {
-        list* push_list = (list*) entry->value;
-        snprintf(buffer, 1024, ":%ld\r\n", push_list->size);
+        snprintf(buffer, 1024, ":%ld\r\n", ((list*)entry->value)->size);
     } else {
         strcpy(buffer, ":0\r\n");
     }
 }
 
 void pop_from_list(char* key, int count, char* buffer) {
-    if (count < 0) {
-        strcpy(buffer, "-ERR invalid count\r\n");
-    }
-
     hashmap_entry* entry = hashmap_find_entry(&map, key);
     if (entry != NULL && entry->value_type == TYPE_LIST) {
-        list* current_list = entry->value;
-        if (count >= current_list->size) {
-            count = current_list->size;
-        }
+        list* current_list = (list*)entry->value;
+        if (count > current_list->size) count = current_list->size;
 
         if (count == 0 || !current_list->head) {
             strcpy(buffer, "$-1\r\n");
@@ -445,9 +427,8 @@ void pop_from_list(char* key, int count, char* buffer) {
             snprintf(buffer, 1024, "$%ld\r\n%s\r\n", strlen(head->value),(char*) head->value);
             delete_from_head(current_list);
         } else {
-            get_values_array(current_list, 0, count - 1, buffer); // get all the values from the list
-
-            for(int i = 0; i < count; i++) { // delete the elements from the list
+            get_values_array(current_list, 0, count - 1, buffer);
+            for(int i = 0; i < count; i++) {
                 delete_from_head(current_list);
             }
         }
@@ -456,18 +437,20 @@ void pop_from_list(char* key, int count, char* buffer) {
     }
 }
 
-void add_to_stream(char* key, char* id, char* field, char* value, char* buffer) {
+void add_to_stream(char* key, char* id, char** field_value_pairs, int num_pairs, char* buffer) {
     hashmap_entry* entry = hashmap_find_entry(&map, key);
     stream* s;
+
     if (!entry) {
         s = create_stream();
         metadata* metadata_value = malloc(sizeof(metadata));
         metadata_value->timestamp = 0;
         metadata_value->time_to_live = -1;
         hashmap_add_entry(&map, key, s, metadata_value, TYPE_STREAM);
+        free(metadata_value); // The entry in the hashmap now owns its own copy
     } else {
         if (entry->value_type != TYPE_STREAM) {
-            strcpy(buffer, "$-1\r\n");
+            strcpy(buffer, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
             return;
         }
         s = (stream*) entry->value;
@@ -480,220 +463,222 @@ void add_to_stream(char* key, char* id, char* field, char* value, char* buffer) 
     int sequence_number;
     char* new_id = validate_id(id, top_id, &timestamp_ms, &sequence_number, buffer);
 
-    if (buffer[0] == '-' || !new_id) {
+    // If validate_id returned an error message in the buffer or failed, exit.
+    if (!new_id) {
         return;
     }
 
-    char* fields[1] = { field };
-    char* values[1] = { value };
-    add_stream_entry(s, new_id, fields, values, 1);
+    // Prepare separate arrays for fields and values for add_stream_entry
+    char* fields[num_pairs];
+    char* values[num_pairs];
+    for (int i = 0; i < num_pairs; i++) {
+        fields[i] = field_value_pairs[i * 2];
+        values[i] = field_value_pairs[i * 2 + 1];
+    }
+
+    add_stream_entry(s, new_id, fields, values, num_pairs);
 
     snprintf(buffer, 1024, "$%ld\r\n%s\r\n", strlen(new_id), new_id);
-    free(new_id);
+    free(new_id); // Clean up the generated ID
 }
 
 char* validate_id(char* id, char* top_id, long long* timestamp_ms, int* sequence_number, char* buffer) {
-    char* new_id = NULL;
-
-    new_id = malloc(256);
+    char* new_id = malloc(256);
     if (!new_id) {
         strcpy(buffer, "-ERR Out of memory\r\n");
         return NULL;
     }
 
-    if (sscanf(id, "%lld-%d", timestamp_ms, sequence_number) == 2) {
-        if (*timestamp_ms == 0 && *sequence_number == 0) {
+    long long top_ts = -1;
+    int top_seq = -1;
+    if (top_id[0] != '\0') {
+        sscanf(top_id, "%lld-%d", &top_ts, &top_seq);
+    }
+
+    long long req_ts = -1;
+    int req_seq = -1;
+
+    if (strcmp(id, "*") == 0) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        req_ts = tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+        req_seq = -1;
+    } else if (sscanf(id, "%lld-%d", &req_ts, &req_seq) == 2) {
+        // do nothing, handling at the end
+    } else if (sscanf(id, "%lld-*", &req_ts) == 1 && id[strlen(id)-1] == '*') {
+        // do nothing, handling at the end
+    } else {
+        strcpy(buffer, "-ERR Invalid stream ID specified for XADD\r\n");
+        free(new_id);
+        return NULL;
+    }
+
+    if (req_seq != -1) { // A specific sequence was provided by the user
+        *timestamp_ms = req_ts;
+        *sequence_number = req_seq;
+    } else { // Sequence needs to be auto-generated
+        *timestamp_ms = req_ts;
+        if (*timestamp_ms > top_ts) {
+            *sequence_number = 0;
+        } else { // *timestamp_ms <= top_ts
+            *timestamp_ms = top_ts; // Ensure timestamp doesn't go backwards
+            *sequence_number = top_seq + 1;
+        }
+    }
+
+    if (*timestamp_ms == 0 && *sequence_number == 0) {
+        if (req_seq != -1) {
             strcpy(buffer, "-ERR The ID specified in XADD must be greater than 0-0\r\n");
             free(new_id);
             return NULL;
         }
-        if (top_id[0] != '\0') {
-            long long top_ts = -1;
-            int top_seq = -1;
-            sscanf(top_id, "%lld-%d", &top_ts, &top_seq);
-            if (*timestamp_ms < top_ts ||
-                (*timestamp_ms == top_ts && *sequence_number <= top_seq)) {
-                strcpy(buffer, "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n");
-                free(new_id);
-                return NULL;
-            }
-        }
-        sprintf(new_id, "%lld-%d", *timestamp_ms, *sequence_number);
-        return new_id;
+        *sequence_number = 1;
     }
 
-    if (sscanf(id, "%lld-%d", timestamp_ms, sequence_number) != 2) {
-        if (id[0] == '*') {
-            struct timeval tv;
-            gettimeofday(&tv, NULL);
-            *timestamp_ms = tv.tv_sec * 1000 + tv.tv_usec / 1000;
-            *sequence_number = -1;
-        } else if (id[strlen(id) - 1] == '*') {
-            char ts_buf[256];
-            strncpy(ts_buf, id, strlen(id) - 1);
-            ts_buf[strlen(id) - 1] = '\0';
-            *timestamp_ms = atoll(ts_buf);
-
-            long long top_timestamp_ms = -1;
-            int top_sequence_number = -1;
-            if (top_id[0] != '\0') {
-                sscanf(top_id, "%lld-%d", &top_timestamp_ms, &top_sequence_number);
-            }
-
-            if (top_id[0] == '\0' || *timestamp_ms != top_timestamp_ms) {
-                *sequence_number = (*timestamp_ms == 0) ? 1 : 0;
-            } else {
-                *sequence_number = top_sequence_number + 1;
-            }
-        }
-
+    if (top_id[0] != '\0' && (*timestamp_ms < top_ts || (*timestamp_ms == top_ts && *sequence_number <= top_seq))) {
+        strcpy(buffer, "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n");
+        free(new_id);
+        return NULL;
     }
 
-
-    if (*timestamp_ms == 0 && *sequence_number == 0) {
-        strcpy(buffer, "-ERR The ID specified in XADD must be greater than 0-0\r\n");
-        return new_id;
-    }
-
-    if(top_id[0] == '\0') {
-        if (*timestamp_ms == 0) {
-            *sequence_number = 1;
-        } else {
-            *sequence_number = 0;
-        }
-        sprintf(new_id, "%lld-%d", *timestamp_ms, *sequence_number);
-        return new_id;
-    }
-
-    if(top_id[0] != '\0') {
-        long long top_timestamp_ms = -1;
-        int top_sequence_number = -1;
-        if (sscanf(top_id, "%lld-%d", &top_timestamp_ms, &top_sequence_number) != 2) {
-            strcpy(buffer, "-ERR Invalid top ID format\r\n");
-            return NULL;
-        }
-        if (*timestamp_ms < top_timestamp_ms || (*timestamp_ms == top_timestamp_ms && *sequence_number <= top_sequence_number)) {
-            strcpy(buffer, "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n");
-            return NULL;
-        }
-        sprintf(new_id, "%lld-%d", *timestamp_ms, *sequence_number);
-        return new_id;
-    }
-
+    sprintf(new_id, "%lld-%d", *timestamp_ms, *sequence_number);
     return new_id;
 }
 
 void range_from_stream(char* key, char* start_id, char* end_id, char* buffer) {
     hashmap_entry* entry = hashmap_find_entry(&map, key);
-    stream* s;
-    if (!entry) {
-        strcpy(buffer, "*0\r\n");
-        return;
+    if (entry && entry->value_type == TYPE_STREAM) {
+        get_stream_entries(entry->value, start_id, end_id, buffer);
     } else {
-        if (entry->value_type != TYPE_STREAM) {
-            strcpy(buffer, "*0\r\n");
-            return;
-        }
-        s = entry->value;
-        get_stream_entries(s, start_id, end_id, buffer);
+        strcpy(buffer, "*0\r\n");
     }
-
-    return;
 }
 
-void xread_from_multiple_streams(char** arguments, int argument_count, char* buffer, int fd) {
-    int num_streams = argument_count / 2;
+void xread_from_multiple_streams(char** arguments, int arguments_count, char* buffer, int fd) {
+    int block_idx = -1, streams_idx = -1;
+    for (int i = 1; i < arguments_count; i++) {
+        if (strcasecmp(arguments[i], "block") == 0) block_idx = i;
+        if (strcasecmp(arguments[i], "streams") == 0) streams_idx = i;
+    }
+
+    if (streams_idx == -1) {
+        strcpy(buffer, "-ERR syntax error: streams keyword not found\r\n");
+        return;
+    }
+
+    int num_stream_args = arguments_count - (streams_idx + 1);
+    if (num_stream_args <= 0 || num_stream_args % 2 != 0) {
+        strcpy(buffer, "-ERR syntax error: incorrect number of stream keys/IDs\r\n");
+        return;
+    }
+    int num_streams = num_stream_args / 2;
+
     char* keys[num_streams];
     char* ids[num_streams];
-    if (strcmp(arguments[1], "block") == 0) {
-        num_streams--; // because we should remove the pair of block and timeout
-        int timeout = atoi(arguments[2]);
-        if (timeout < 0) {
-            strcpy(buffer, "*0\r\n");
-            return;
-        } else if (timeout == 0) {
-            timeout = -1;
-        }
-        for (int i = 0; i < num_streams; i++) { // we should skip the first 4 arguments which are XREAD, block, timeout and streams
-            keys[i] = arguments[i + 4];
-            if (strcmp(arguments[i + num_streams + 4], "$") == 0) {
-                hashmap_entry* entry = hashmap_find_entry(&map, keys[i]);
-                char* max_id = "0-0";
-                if (entry && entry->value_type == TYPE_STREAM) {
-                    stream* s = (stream*) entry->value;
-                    if (s->tail) max_id = s->tail->id;
-                }
-                ids[i] = strdup(max_id);
-            } else {
-                ids[i] = arguments[i + num_streams + 4];
-            }
-        }
-        handle_xread_block(keys, ids, num_streams, fd, timeout);
-        buffer[0] = '\0';
-        return;
-    } else {
-        for (int i = 0; i < num_streams; i++) { // we should skip the first 2 arguments which are XREAD and streams
-            keys[i] = arguments[i + 2];
-            ids[i] = arguments[i + num_streams + 2];
-        }
-    }
-
-    char temp[1024 * 16] = {0};
-    int stream_count = 0;
+    int free_ids_flags[num_streams];
+    memset(free_ids_flags, 0, sizeof(free_ids_flags));
 
     for (int i = 0; i < num_streams; i++) {
-        hashmap_entry* entry = hashmap_find_entry(&map, keys[i]);
-        if (!entry || entry->value_type != TYPE_STREAM) {
-            continue; // i am just skipping this stream and checking the next one
-        }
-        stream* s = (stream*) entry->value;
-
-        char stream_buffer[1024 * 8] = {0};
-        if (xread_stream_entries(s, ids[i], keys[i], stream_buffer)) {
-            strcat(temp, stream_buffer);
-            stream_count++;
+        keys[i] = arguments[streams_idx + 1 + i];
+        char* id_arg = arguments[streams_idx + 1 + num_streams + i];
+        if (strcmp(id_arg, "$") == 0) {
+            hashmap_entry* entry = hashmap_find_entry(&map, keys[i]);
+            if (entry && entry->value_type == TYPE_STREAM) {
+                stream* s = (stream*)entry->value;
+                if (s->tail) {
+                    ids[i] = strdup(s->tail->id);
+                    free_ids_flags[i] = 1;
+                } else {
+                    ids[i] = "0-0";
+                }
+            } else {
+                ids[i] = "0-0";
+            }
+        } else {
+            ids[i] = id_arg;
         }
     }
 
-    if (stream_count == 0) {
-        strcpy(buffer, "*0\r\n");
-        return;
+    if (block_idx != -1) {
+        int timeout_ms = atoi(arguments[block_idx + 1]);
+        if (timeout_ms == 0) timeout_ms = -1; // Block indefinitely
+        handle_xread_block(keys, ids, num_streams, fd, timeout_ms);
+        buffer[0] = '\0'; // Response is handled asynchronously by blocking logic
     } else {
-        snprintf(buffer, 1024 * 16, "*%d\r\n%s", stream_count, temp);
+        // Non-blocking XREAD
+        char temp[1024 * 16] = {0};
+        int stream_count = 0;
+        for (int i = 0; i < num_streams; i++) {
+            hashmap_entry* entry = hashmap_find_entry(&map, keys[i]);
+            if (!entry || entry->value_type != TYPE_STREAM) continue;
+            char stream_buffer[1024 * 8] = {0};
+            if (xread_stream_entries(entry->value, ids[i], keys[i], stream_buffer)) {
+                strcat(temp, stream_buffer);
+                stream_count++;
+            }
+        }
+        if (stream_count == 0) {
+            strcpy(buffer, "$-1\r\n");
+        } else {
+            snprintf(buffer, 1024 * 16, "*%d\r\n%s", stream_count, temp);
+        }
+    }
+
+    // Free any strdup'd IDs for the '$' case
+    for(int i = 0; i < num_streams; i++) {
+        if(free_ids_flags[i]) free(ids[i]);
     }
 }
 
-// please refer here for RESP protocol specification:
-// // https://redis.io/docs/latest/develop/reference/protocol-spec/
+void incr_key(char* key, char* buffer) {
+    hashmap_entry* entry = hashmap_find_entry(&map, key);
+    if (!entry) {
+        set_key_value(key, "1", buffer, NULL, -1);
+        strcpy(buffer, ":1\r\n");
+        return;
+    }
+    if (entry->value_type != TYPE_STRING) {
+        strcpy(buffer, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+        return;
+    }
+    char* value_str = (char*) entry->value;
+    char* endptr;
+    long value = strtol(value_str, &endptr, 10);
+    if (*endptr != '\0') {
+        strcpy(buffer, "-ERR value is not an integer or out of range\r\n");
+        return;
+    }
+    value++;
+    char new_value[32];
+    snprintf(new_value, sizeof(new_value), "%ld", value);
+    free(entry->value);
+    entry->value = strdup(new_value);
+    sprintf(buffer, ":%ld\r\n", value);
+}
 
 void parse_input(char* buffer, char* command, char** arguments, int* argument_count, int* length) {
     int pos = 0;
-    // according to RESP, initially we get array i.e * for anything other than PING
-
-    if(buffer[pos] != '*') return;
+    *argument_count = 0;
+    *length = 0;
+    if(buffer[0] != '*') return;
     pos++;
-
     int num_elements = atoi(&buffer[pos]);
-    while(buffer[pos] != '\r' && buffer[pos] != '\n') pos++; // we are skipping anything that is not a new line or carriage return
-    pos += 2; // now we are also skipping the new line or carriage return
-
+    while(buffer[pos] != '\r' && buffer[pos] != '\n') pos++;
+    pos += 2;
     for(int i = 0; i < num_elements; i++) {
-        if(buffer[pos] != '$') return; // the length of anything starts with $.
-        pos++; // skip the $ symbol
-
+        if(buffer[pos] != '$') return;
+        pos++;
         int bulk_len = atoi(&buffer[pos]);
-        while(buffer[pos] != '\r' && buffer[pos] != '\n') pos++; // we are skipping anything that is not a new line or carriage return
-        pos += 2; // now we are also skipping the new line or carriage return
-
+        while(buffer[pos] != '\r' && buffer[pos] != '\n') pos++;
+        pos += 2;
         char* arg = malloc(bulk_len + 1);
-        memcpy(arg, &buffer[pos], bulk_len); // copy the data into the allocated memory
-        arg[bulk_len] = '\0'; // null terminate the string
-
-        arguments[(*argument_count)++] = arg; // add the argument to the array
-        *length += bulk_len; // increment the length by the length of the argument
-        pos += bulk_len; // skip the argument
-        pos += 2; // skip the new line and carriage return
+        memcpy(arg, &buffer[pos], bulk_len);
+        arg[bulk_len] = '\0';
+        arguments[(*argument_count)++] = arg;
+        *length += bulk_len;
+        pos += bulk_len;
+        pos += 2;
     }
-
-    strcpy(command, arguments[0]);
+    if(*argument_count > 0)
+        strcpy(command, arguments[0]);
 }
