@@ -1,38 +1,56 @@
 # Redis Clone in C – Codecrafters Challenge
 
-Welcome! This repo contains my solutions for the [Codecrafters Redis](https://codecrafters.io/challenges/redis) challenge. The goal is to build a minimal Redis server from scratch in C, implementing core features like TCP networking, RESP protocol parsing, and basic commands (`PING`, `ECHO`, `SET`, `GET`)—all with support for key expiry.
+Welcome! This repo contains my solutions for the [Codecrafters Redis](https://codecrafters.io/challenges/redis) challenge.
+The goal: build a minimal Redis server from scratch in C, with real networking, RESP protocol parsing, and support for strings, lists, streams, blocking commands, and transactions.
+
+---
 
 ## What This Project Is About
 
-This project is a hands-on exploration of how Redis works under the hood. By building everything from the socket layer up, I learned about:
-- Handling multiple clients using `select()`
-- Parsing the RESP (REdis Serialization Protocol) format
-- Managing an in-memory key-value store
-- Implementing TTL (time-to-live) for automatic key expiry
+This project is a deep dive into how Redis works under the hood.
+By building everything from the socket layer up, I learned about:
 
-All features were tested using the official Codecrafters test suite and verified with `redis-cli`.
+- **Efficient event loops:** Using `epoll` to handle multiple clients concurrently.
+- **RESP protocol:** Parsing arrays, bulk strings, and handling all edge cases for protocol compliance.
+- **In-memory data structures:** Hash maps for keys, double-linked lists for lists, and custom stream structures.
+- **Blocking commands:** Implementing BLPOP and XREAD BLOCK with proper client waiting, notification, and timeouts.
+- **Streams:** Supporting XADD (with auto and partial ID generation), XRANGE, and XREAD (including `$` for "only new entries").
+- **Transactions:** Full support for MULTI/EXEC, with per-client command queues and correct isolation.
+- **Per-client state:** Each client is tracked with its own struct, supporting transaction state, queued commands, and proper cleanup on disconnect.
+- **Memory management:** Careful allocation, cleanup, and defensive programming to avoid leaks and crashes.
+
+All features are tested using the Codecrafters test suite and verified with `redis-cli`.
+
+---
 
 ## Features Implemented
 
 Here’s what’s working so far:
 
-- **Networking:** Accepts multiple clients over TCP (port 6379)
-- **RESP Parsing:** Handles arrays and bulk strings for command/argument extraction
-- **Commands:**
-  - `PING` – Replies with `PONG`
-  - `ECHO` – Replies with the provided argument as a bulk string
-  - `SET` – Stores a key-value pair, with optional PX (TTL in ms)
-  - `GET` – Retrieves a value, returns null bulk string if expired or missing
-- **Expiry:** Keys set with PX expire automatically after the specified time
-- **Memory Management:** Uses a linked list for the key-value store, with careful allocation and cleanup
+- **Networking:** Handles multiple clients over TCP (port 6379) using `epoll` for scalability.
+- **RESP Parsing:** Full support for arrays, bulk strings, and correct error/null handling.
+- **Key-Value Store:** Hash map with support for:
+  - **Strings:** `SET`, `GET`, `TYPE`, `INCR` (with integer validation).
+  - **Lists:** `RPUSH`, `LPUSH`, `LRANGE`, `LLEN`, `LPOP`, `BLPOP` (with FIFO blocking and timeouts).
+  - **Streams:** `XADD` (with correct ID handling), `XRANGE`, `XREAD` (multi-stream, blocking, `$` support).
+- **Blocking Commands:**
+  - **BLPOP:** Blocks clients, serves them in FIFO order, supports timeouts.
+  - **XREAD BLOCK:** Blocks on one or more streams, supports `$` for "wait for new entries", and handles timeouts.
+- **Transactions:**
+  - **MULTI/EXEC:** Per-client command queues, correct queuing and execution, isolation between clients, and proper cleanup on EXEC/DISCARD or disconnect.
+  - **Queued command structure:** Each client maintains its own queue of commands and arguments, ensuring correct transactional behavior.
+- **Timeouts:** Dynamic timeout calculation for efficient event loop wakeups.
+- **Concurrency:** Robust handling of multiple clients, proper cleanup on disconnect.
+- **Defensive Programming:** Protocol compliance, error handling, and edge case coverage.
+- **Memory Management:** All data structures are carefully allocated and freed.
 
-> For each command, you can connect using `redis-cli` or any RESP-compatible client and interact as you would with a real Redis server.
+---
 
 ## How to Run and Test
 
 1. **Build the server:**
    ```sh
-   gcc -o redis_server src/main.c
+   gcc -o redis_server src/main.c src/hashmap.c src/double_linked_list.c src/stream.c src/blocking_wait.c
    ```
 2. **Start the server:**
    ```sh
@@ -44,21 +62,44 @@ Here’s what’s working so far:
    ```
 4. **Try out commands:**
    ```
-   PING
-   ECHO hello
+   # Strings
    SET fruit apple
    GET fruit
-   SET temp value px 100
-   GET temp
-   # Wait >100ms, then:
-   GET temp
+   INCR counter
+   TYPE fruit
+   DEL fruit
+
+   # Lists
+   RPUSH mylist a b c
+   LRANGE mylist 0 -1
+   BLPOP mylist 5
+
+   # Streams
+   XADD mystream * temperature 22
+   XRANGE mystream - +
+   XREAD BLOCK 1000 STREAMS mystream $
+
+   # Blocking
+   BLPOP mylist 2
+   XREAD BLOCK 5000 STREAMS mystream $
+
+   # Transactions
+   MULTI
+   SET a 1
+   INCR a
+   EXEC
+   DISCARD
    ```
+
+---
 
 ## Notes & Credits
 
 - The Codecrafters challenge and test suite are provided by [Codecrafters](https://codecrafters.io/).
 - My contributions here are the C implementation and this documentation.
 - If you’re learning systems programming, I highly recommend trying the challenge yourself before looking at solutions!
+
+---
 
 ## License Info
 
@@ -69,16 +110,3 @@ Any test scripts or challenge materials from Codecrafters are © Codecrafters an
 ---
 
 Feel free to fork this repo or use it for reference, but remember—building it yourself is the best way to learn!
-
-
-[![progress-banner](https://backend.codecrafters.io/progress/redis/54a03e86-4d1b-4867-9b13-512148e7edc8)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
-
-## Notes & Credits
-
-- This project was inspired and guided by the [Codecrafters Redis challenge](https://codecrafters.io/challenges/redis).
-- Huge thanks to Codecrafters for designing the challenge and providing the test suite—your platform makes learning systems programming fun and accessible!
-- My contributions here are the C implementation and this documentation.
-- If you’re learning systems programming, I highly recommend trying the challenge yourself before looking at solutions!
-
-This is a starting point for C solutions to the
-["Build Your Own Redis" Challenge](https://codecrafters.io/challenges/redis).
