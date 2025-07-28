@@ -54,7 +54,10 @@ void handle_exec_command(client* client, char* buffer);
 void handle_discard_command(client* client, char* buffer);
 void handle_queue_command(client* client, char* request, char* response);
 
-int main() {
+// these are for info handling
+void handle_info_command(client* client, char** arguments, int arguments_count, char* response);
+
+int main(int argc, char* argv[]) {
 	setbuf(stdout, NULL);
 	setbuf(stderr, NULL);
 	printf("Logs from your program will appear here!\n");
@@ -62,6 +65,26 @@ int main() {
 	int server_fd;
 	socklen_t client_addr_len;
 	struct sockaddr_in client_addr;
+
+	int port = 6379;
+    int is_port_set = 0;
+    int is_replica = 0;
+    char* replica_host = NULL;
+    int replica_port = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if ((strcmp(argv[i], "--port") == 0 || strcmp(argv[i], "-p") == 0) && i + 1 < argc) {
+            port = atoi(argv[i + 1]);
+            is_port_set = 1;
+            i++;
+        } else if (strcasecmp(argv[i], "--replicaof") == 0 && i + 1 < argc) {
+            is_replica = 1;
+            replica_host = argv[i + 1];
+            i += 1;
+        } else {
+            printf("Unknown or malformed argument: %s\n", argv[i]);
+        }
+    }
 
 	server_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (server_fd == -1) {
@@ -76,7 +99,7 @@ int main() {
 	}
 
 	struct sockaddr_in serv_addr = { .sin_family = AF_INET ,
-									 .sin_port = htons(6379),
+									 .sin_port = htons(port),
 									 .sin_addr = { htonl(INADDR_ANY) },
 									};
 
@@ -128,6 +151,7 @@ int main() {
                 if(new_client_fd > 0) {
                     printf("Client %d Connected\n", new_client_fd);
                     client* new_client = create_client(new_client_fd);
+                    new_client->role = is_replica ? CLIENT_ROLE_SLAVE : CLIENT_ROLE_MASTER;
                     add_client(&client_head, new_client);
 
                     ev.events = EPOLLIN;
@@ -176,6 +200,8 @@ int main() {
     destroy_all_clients(&client_head);
 	return 0;
 }
+
+
 
 void handle_input(char* request, client* client, char* response) {
     char command[100] = {0};
@@ -275,6 +301,8 @@ void handle_input(char* request, client* client, char* response) {
         strcpy(response, "-ERR EXEC without MULTI\r\n");
     } else if (strcasecmp(command, "DISCARD") == 0) {
         strcpy(response, "-ERR DISCARD without MULTI\r\n");
+    } else if (strcasecmp(command, "INFO") == 0) {
+        handle_info_command(client, arguments, arguments_count, response);
     } else {
         strcpy(response, "-ERR unknown command\r\n");
     }
@@ -282,6 +310,23 @@ void handle_input(char* request, client* client, char* response) {
 cleanup:
     for(int i = 0; i < arguments_count; i++) {
         free(arguments[i]);
+    }
+}
+
+void handle_info_command(client* client, char** arguments, int arguments_count, char* response) {
+    if (arguments_count < 2) strcpy(response, "-ERR wrong number of arguments\r\n");
+    else if (strcasecmp(arguments[1], "REPLICATION") == 0) {
+        char* role = client->role == CLIENT_ROLE_MASTER ? "master" : "slave";
+        char info_buffer[1024];
+        char* replid = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+        snprintf(info_buffer, sizeof(info_buffer),
+            "role:%s\r\n"
+            "master_replid:%s\r\n"
+            "master_repl_offset:0",
+            role, replid);
+        sprintf(response, "$%ld\r\n%s\r\n", strlen(info_buffer), info_buffer);
+    } else {
+        strcpy(response, "-ERR unknown info type\r\n");
     }
 }
 

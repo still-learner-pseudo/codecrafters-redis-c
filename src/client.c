@@ -10,6 +10,7 @@ client* create_client(int fd) {
     c->in_multi = 0;
     c->queued_commands = NULL;
     c->command_count = 0;
+    c->role = CLIENT_ROLE_UNKNOWN;
     c->next = NULL;
     return c;
 }
